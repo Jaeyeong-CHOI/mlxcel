@@ -321,25 +321,23 @@ impl Attention {
         // layer is global). `attention_from_ptr` with no mask is not causal,
         // so take MLX's maskless causal SDPA mode explicitly.
         let k_len = mlxcel_core::array_shape(&cache_k)[2];
-        let attn_out = if mask.is_none()
-            && l > 1
-            && (self.window_size == 0 || k_len <= self.window_size)
-        {
-            mlxcel_core::causal_attention(&q, &cache_k, &cache_v, self.scale, 0.0, 0)
-        } else {
-            let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
-            unsafe {
-                mlxcel_core::layers::attention_from_ptr(
-                    &q,
-                    &cache_k,
-                    &cache_v,
-                    self.scale,
-                    mask_ptr,
-                    0.0,
-                    self.window_size,
-                )
-            }
-        };
+        let attn_out =
+            if mask.is_none() && l > 1 && (self.window_size == 0 || k_len <= self.window_size) {
+                mlxcel_core::causal_attention(&q, &cache_k, &cache_v, self.scale, 0.0, 0)
+            } else {
+                let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
+                unsafe {
+                    mlxcel_core::layers::attention_from_ptr(
+                        &q,
+                        &cache_k,
+                        &cache_v,
+                        self.scale,
+                        mask_ptr,
+                        0.0,
+                        self.window_size,
+                    )
+                }
+            };
 
         // Transpose back and reshape
         let attn_out = mlxcel_core::transpose_axes(&attn_out, &[0, 2, 1, 3]);

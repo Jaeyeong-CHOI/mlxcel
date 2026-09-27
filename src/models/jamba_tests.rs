@@ -477,7 +477,10 @@ fn jamba_prefill_rows_match_token_by_token_decode() {
 
     let build = || {
         let mut weights = dense_expert_weights();
-        weights.insert("model.embed_tokens.weight".into(), varied(&[VOCAB, HIDDEN], 1));
+        weights.insert(
+            "model.embed_tokens.weight".into(),
+            varied(&[VOCAB, HIDDEN], 1),
+        );
         for (i, proj) in ["q_proj", "k_proj", "v_proj", "o_proj"].iter().enumerate() {
             weights.insert(
                 format!("model.layers.0.self_attn.{proj}.weight"),
@@ -489,7 +492,9 @@ fn jamba_prefill_rows_match_token_by_token_decode() {
     };
     let vocab = VOCAB as usize;
     for (case, (warm, chunk)) in [(0usize, 6usize), (3, 5)].into_iter().enumerate() {
-        let tokens: Vec<i32> = (0..(warm + chunk) as i32).map(|i| (i * 5 + 1) % VOCAB).collect();
+        let tokens: Vec<i32> = (0..(warm + chunk) as i32)
+            .map(|i| (i * 5 + 1) % VOCAB)
+            .collect();
 
         let reference = build();
         let seq_ref = SequenceId::from_raw(1_991_000 + case as u64);
@@ -518,7 +523,10 @@ fn jamba_prefill_rows_match_token_by_token_decode() {
                 .zip(&want[warm + row])
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0f32, f32::max);
-            assert!(max < 1e-4, "warm {warm} chunk {chunk} row {row}: max |diff| {max}");
+            assert!(
+                max < 1e-4,
+                "warm {warm} chunk {chunk} row {row}: max |diff| {max}"
+            );
         }
     }
 }
