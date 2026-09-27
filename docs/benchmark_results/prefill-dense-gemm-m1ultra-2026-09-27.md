@@ -70,8 +70,31 @@ about 100 s of sustained GPU load, reproduced with a Python MLX GEMM alone and
 cleared only by a restart. Every run taken in a degraded window was discarded;
 the tables above come from windows where the GEMM check held above 13 TFLOPS.
 
+## M5 Max (why the default excludes M5)
+
+Mac17,7 Apple M5 Max 128 GB, branch `3eb871ea`, one binary with the path off
+and on (`MLXCEL_PREFILL_DEQUANT_MIN_M=256`), order off on on off with a 20 s
+cooldown before every run, indexers suspended, load average 2.2 to 1.4.
+Prefill tok/s per run, median change, and MLX peak memory off / on.
+
+| Model | pt | off, on, on, off | Change | Peak GB |
+|---|---|---|---|---|
+| Llama 3.1 8B | 512 | 3651, 3202, 3212, 3650 | -12.1% | 5.25 / 5.81 |
+| Llama 3.1 8B | 1024 | 3757, 3616, 3618, 3758 | -3.7% | 5.62 / 6.22 |
+| Llama 3.1 8B | 2048 | 3782, 3752, 3748, 3785 | -0.9% | 6.13 / 6.59 |
+| Qwen2.5 7B | 512 | 3898, 3338, 3332, 3890 | -14.4% | 4.91 / 5.70 |
+| Qwen2.5 7B | 1024 | 4027, 3918, 3921, 4041 | -2.8% | 5.29 / 5.91 |
+| Qwen2.5 7B | 2048 | 4054, 4057, 4075, 4052 | +0.3% | 5.54 / 6.20 |
+| Phi-3 mini | 512 | 7003, 6036, 6042, 7006 | -13.8% | 3.07 / 3.63 |
+| Phi-3 mini | 1024 | 6913, 6745, 6740, 6912 | -2.5% | 3.76 / 3.74 |
+| Phi-3 mini | 2048 | 7084, 7069, 7067, 7086 | -0.2% | 4.45 / 4.58 |
+
+M5's `quantized_matmul` (with the Neural Accelerator) is strong enough that
+the dense path only reaches break-even around 2048 rows. Greedy output on
+Llama 3.1 8B with a 1609-token prompt is identical with the path on and off.
+
 ## Not measured
 
-M2, M3, M4 and M5 (the default is off there until measured), CUDA and ROCm, and
+M2, M3 and M4 (the default is off there until measured), CUDA and ROCm, and
 the server's chunked prefill, whose default 512-token chunks stay below the
 threshold.

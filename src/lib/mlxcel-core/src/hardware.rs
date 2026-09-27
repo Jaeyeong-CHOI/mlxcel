@@ -506,10 +506,13 @@ pub const PREFILL_DENSE_GEMM_ENV: &str = "MLXCEL_PREFILL_DEQUANT_MIN_M";
 
 /// Hardware default for [`PREFILL_DENSE_GEMM_MIN_ROWS`]: on for M1 only.
 ///
-/// Only M1 Ultra was measured. M2 through M4 differ in GPU microarchitecture,
-/// M5 adds the Neural Accelerator (its `quantized_matmul` and dense matmul both
-/// change), and later or non-Apple devices report `Unknown`, so every other
-/// generation keeps `quantized_matmul` until it is measured and added here.
+/// Measured on M1 Ultra (the gain above) and M5 Max, where the dense path is
+/// slower at every size tried: Llama 3.1 8B -12.1% / -3.7% / -0.9% at 512 /
+/// 1024 / 2048 rows, Qwen2.5 7B -14.4% / -2.8% / +0.3%, Phi-3 mini -13.8% /
+/// -2.5% / -0.2%, with +0.5 to 0.8 GB of peak memory, so M5 stays off. M2
+/// through M4 differ in GPU microarchitecture and were not measured, and later
+/// or non-Apple devices report `Unknown`; they keep `quantized_matmul` until a
+/// measurement adds them here.
 #[must_use]
 pub fn prefill_dense_gemm_min_rows_default(r#gen: AppleSiliconGen) -> Option<i64> {
     (r#gen == AppleSiliconGen::M1).then_some(PREFILL_DENSE_GEMM_MIN_ROWS)
