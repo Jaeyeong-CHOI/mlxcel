@@ -19,8 +19,11 @@ CARGO := cargo
 #
 # So the right value depends on what else is resident, not on the core count:
 # check that first. `-j 6` is what has built this workspace here when the GPU
-# services are idle, and is not enough when they are not. `verify-rocm-smoke`
-# reports available memory before it starts for that reason.
+# services are idle, and is not enough when they are not. Measured with them
+# stopped, a full `verify-rocm` at this value never dropped below 14.8 GiB
+# available, so the cap is conservative on an otherwise free machine and the
+# co-tenants really were the constraint. `verify-rocm-smoke` reports available
+# memory before it starts for that reason.
 ROCM_JOBS ?= -j 6
 RUSTFLAGS := RUSTFLAGS="-C target-cpu=native"
 WEBUI_CONTRACT_PY ?= python3
@@ -788,8 +791,17 @@ verify-rocm-smoke: ## ROCm smoke: build, link and generate on the GPU, asserting
 	@echo "$(CYAN)[verify] rocm smoke (build, link, generate)...$(RESET)"
 	@bash scripts/ci/rocm_smoke.sh
 
+# Order matters here, and not in the usual cheap-first way. `verify-rocm-smoke`
+# runs BEFORE `verify-test-rocm` because make stops at the first failing
+# prerequisite, and the ROCm test gate currently has known failures (the nvfp4
+# abort of #1806 and the sampler aborts of #1885). With the test gate first the
+# smoke was never reached at all, which was measured rather than reasoned: the
+# first full run of this target ended without the smoke having executed once.
+# The smoke is also the fastest high-signal part, so a developer gets the
+# "does a real forward pass still run on this device" answer even while the
+# suite is red.
 .PHONY: verify-rocm
-verify-rocm: verify-versions verify-kernel-dtype-keys verify-llama-compat verify-fmt verify-clippy-rocm verify-test-rocm verify-rocm-smoke ## Run the ROCm gate locally on an AMD host (issue #1811)
+verify-rocm: verify-versions verify-kernel-dtype-keys verify-llama-compat verify-fmt verify-clippy-rocm verify-rocm-smoke verify-test-rocm ## Run the ROCm gate locally on an AMD host (issue #1811)
 	@echo "$(GREEN)[verify-rocm] OK$(RESET)"
 
 .PHONY: verify-versions
