@@ -572,10 +572,15 @@ std::unique_ptr<MlxArray> compiled_swiglu_activation(
     const MlxArray& x
 );
 
-// Residual add fused with the next LayerNorm, one Metal launch:
+// Residual add fused with the next LayerNorm, one kernel launch:
 // x_out = (a + b) + x, h_out = layer_norm(x_out, weight, bias). Byte-identical to
-// compiled_add3 followed by fast::layer_norm. Metal only, D <= 6656; the Rust
-// wrapper (layers::residual_add3_layer_norm) checks that. Used by: Cohere2
+// compiled_add3 followed by fast::layer_norm on the same backend. Metal and
+// ROCm (lablup/mlxcel#2069), D <= 6656; the Rust wrapper
+// (layers::residual_add3_layer_norm) checks both, the backend through
+// fused_add3_layer_norm_available(), which reads the kernel's port table and
+// is false off the GPU stream (MLXCEL_DEVICE=cpu).
+// Used by: Cohere2
+bool fused_add3_layer_norm_available();
 void fused_add3_layer_norm(
     const MlxArray& a,
     const MlxArray& b,
@@ -1427,6 +1432,10 @@ bool bitlinear_kernel_available();
 // reuses. Metal, CUDA and ROCm.
 bool fused_moe_kernels_available();
 bool moe_down_kernel_available();
+// Both kernels of `fused_moe_forward`'s opt-in `MLXCEL_FUSED_MOE_RELU2` branch:
+// the fc1 squared-ReLU kernel and the down kernel. Metal and ROCm
+// (lablup/mlxcel#2069), on the GPU stream only.
+bool fused_moe_relu2_kernels_available();
 
 // Whether `quantized_matmul(x, weight, scales, biases)` with a transposed
 // affine weight runs the same dense GEMM that `dequantize` + `matmul` runs, so
@@ -1897,7 +1906,10 @@ std::unique_ptr<MlxArray> fused_moe_geglu_kernel(
 
 // Fused xIELU activation (Apertus). Collapses the ~11 elementwise ops in
 // apertus_xielu into one launch over the MLP intermediate buffer. Falls back to
-// an equivalent elementwise graph on non-Metal back-ends.
+// an equivalent elementwise graph on a backend with no port in `xielu_ports()`
+// (CUDA, CPU); `fused_xielu_kernel_available` answers which (Metal, ROCm since
+// lablup/mlxcel#2069, and false off the GPU stream under MLXCEL_DEVICE=cpu).
+bool fused_xielu_kernel_available();
 std::unique_ptr<MlxArray> fused_xielu(
     const MlxArray& x,
     float alpha_p,
@@ -1977,10 +1989,14 @@ bool ssm_kernel_available();
 // Mamba1 selective scan fused over the sequence (Jamba, issue #2005).
 // x, delta: [batch, seq, d]; b, c: [batch, seq, n]; a: [d, n] (= -exp(A_log));
 // d: [d]; state_in: [batch, d, n]. y: [batch, seq, d] in x's dtype. On Metal
-// the state is carried and returned in float32. On CUDA (issue #1981) every
-// intermediate is rounded to x's dtype exactly as the per-step graph scan
-// rounds it, and state_out is in x's dtype.
+// and ROCm (issue #2069) the state is carried and returned in float32. On CUDA
+// (issue #1981) every intermediate is rounded to x's dtype exactly as the
+// per-step graph scan rounds it, and state_out is in x's dtype.
 bool mamba1_scan_kernel_available();
+// Whether the available variant is the float32-state one (Metal, ROCm), the
+// variant Mamba / Falcon-Mamba take; CUDA's graph-exact variant answers false,
+// as does any backend off the GPU stream (MLXCEL_DEVICE=cpu).
+bool mamba1_scan_float_state_kernel_available();
 // Whether the fused scan can serve these inputs: the kernel is available, the
 // default device is the GPU, the state width fits one warp or simdgroup
 // (n <= 32), and on CUDA all six inputs share one floating dtype (the

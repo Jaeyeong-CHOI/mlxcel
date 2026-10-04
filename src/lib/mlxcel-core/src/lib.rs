@@ -694,10 +694,15 @@ mod ffi {
         /// output = silu(gate) * x
         fn compiled_swiglu_activation(gate: &MlxArray, x: &MlxArray) -> UniquePtr<MlxArray>;
 
-        /// Residual add fused with the next LayerNorm in one Metal launch:
+        /// True when this backend has a port of [`fused_add3_layer_norm`],
+        /// that is Metal or ROCm (issue #2069). Read from the kernel's port
+        /// table, the one the launcher dispatches through.
+        fn fused_add3_layer_norm_available() -> bool;
+
+        /// Residual add fused with the next LayerNorm in one kernel launch:
         /// `x_out = (a + b) + x`, `h_out = layer_norm(x_out, weight, bias)`.
-        /// Byte-identical to `compiled_add3` + `fast_layer_norm`. Metal only,
-        /// last dimension <= 6656; call it through
+        /// Byte-identical to `compiled_add3` + `fast_layer_norm` on the same
+        /// backend. Metal and ROCm, last dimension <= 6656; call it through
         /// [`crate::layers::residual_add3_layer_norm`], which checks both.
         /// Used by: Cohere2
         unsafe fn fused_add3_layer_norm(
@@ -1865,9 +1870,15 @@ mod ffi {
             next_state: &mut UniquePtr<MlxArray>,
         ) -> Result<()>;
 
-        /// Whether the fused Mamba1 selective-scan kernel can run (Metal and
-        /// CUDA; `MLXCEL_MAMBA1_SCAN_KERNEL=0` forces the graph scan).
+        /// Whether the fused Mamba1 selective-scan kernel can run (Metal,
+        /// CUDA and ROCm; `MLXCEL_MAMBA1_SCAN_KERNEL=0` forces the graph
+        /// scan).
         fn mamba1_scan_kernel_available() -> bool;
+
+        /// Whether the kernel that can run is the float32-state variant
+        /// (Metal, and ROCm since issue #2069) rather than CUDA's graph-exact
+        /// one (#1981). Mamba / Falcon-Mamba take only this variant.
+        fn mamba1_scan_float_state_kernel_available() -> bool;
 
         /// Whether the fused scan can serve these inputs: it is available, the
         /// default device is the GPU, `N <= 32`, and on CUDA all six inputs
@@ -1963,12 +1974,21 @@ mod ffi {
             group_size: i32,
         ) -> Result<UniquePtr<MlxArray>>;
 
-        /// Fused xIELU activation (Apertus): one Metal launch covering the
-        /// `apertus_xielu` elementwise graph (square/min/expm1/where/...). The
-        /// per-layer scalars `alpha_p` / `alpha_n` (post-softplus) and `beta` /
-        /// `eps` are passed by value. Greedy temp-0 byte-identical to the
-        /// elementwise path on Apple Silicon; falls back to an equivalent
-        /// elementwise graph on non-Metal back-ends. Gated by `MLXCEL_FUSED_XIELU`.
+        /// True when [`fused_xielu`] runs its fused kernel on this backend,
+        /// that is Metal or ROCm (issue #2069), rather than the elementwise
+        /// fallback. Read from the kernel's port table, the one the dispatch
+        /// reads.
+        fn fused_xielu_kernel_available() -> bool;
+
+        /// Fused xIELU activation (Apertus): one kernel launch (Metal, ROCm)
+        /// covering the `apertus_xielu` elementwise graph
+        /// (square/min/expm1/where/...). The per-layer scalars `alpha_p` /
+        /// `alpha_n` (post-softplus) and `beta` / `eps` are passed by value.
+        /// Byte-identical to the elementwise path where tested: Metal in bf16,
+        /// ROCm (gfx1151) in f32, f16 and bf16; Metal f32 and f16 are held to
+        /// a tolerance only. Falls back to an equivalent elementwise graph where
+        /// [`fused_xielu_kernel_available`] is false (CUDA, CPU). Gated by
+        /// `MLXCEL_FUSED_XIELU`.
         fn fused_xielu(
             x: &MlxArray,
             alpha_p: f32,
@@ -2355,14 +2375,23 @@ mod ffi {
         /// #2065). Read from the kernels' own port tables, so the
         /// `MLXCEL_FUSED_MOE` gate and the launchers behind it
         /// ([`fused_moe_expert_kernel`], [`fused_moe_geglu_kernel`]) cannot
-        /// disagree.
+        /// disagree. False while the default device is the CPU
+        /// (`MLXCEL_DEVICE=cpu`), where a custom kernel cannot run.
         fn fused_moe_kernels_available() -> bool;
 
         /// True when this backend has the fused decode-MoE down kernel port
         /// alone, which Nemotron-H's [`fused_moe_forward`] reuses for its fc2
         /// (issue #2065). Its opt-in `MLXCEL_FUSED_MOE_RELU2` branch also needs
         /// the fc1 squared-ReLU port and declines to `gather_qmm` without it.
+        /// False while the default device is the CPU.
         fn moe_down_kernel_available() -> bool;
+
+        /// True when this backend has both kernels of [`fused_moe_forward`]'s
+        /// opt-in `MLXCEL_FUSED_MOE_RELU2` branch (the fc1 squared-ReLU kernel
+        /// and the down kernel), that is Metal or ROCm (issue #2069). The
+        /// branch reads this same predicate, so where it is false the flag
+        /// leaves the `gather_qmm` routed path in place.
+        fn fused_moe_relu2_kernels_available() -> bool;
 
         /// Whether `quantized_matmul` for this transposed affine projection
         /// runs the same dense GEMM as `dequantize` + `matmul`, so the two
@@ -3966,6 +3995,13 @@ mod sdpa_plan_bucket_tests;
 #[cfg(test)]
 #[path = "fused_moe_parity_tests.rs"]
 mod fused_moe_parity_tests;
+
+// Parity for `fused_moe_forward`'s opt-in squared-ReLU kernel branch
+// (`MLXCEL_FUSED_MOE_RELU2`, ROCm port in #2069) against a dense f32 reference
+// and the `gather_qmm` branch. Metal and ROCm; skips elsewhere.
+#[cfg(test)]
+#[path = "fused_moe_relu2_parity_tests.rs"]
+mod fused_moe_relu2_parity_tests;
 
 // Statistical-correctness, determinism, and routing tests for the Gumbel-max
 // sampling kernel (#900). The kernel replaces `random::categorical` with a
