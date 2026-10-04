@@ -2496,10 +2496,16 @@ mod ffi {
         fn gumbel_max_sample(logits: &MlxArray, temperature: f32) -> Result<UniquePtr<MlxArray>>;
 
         /// True when [`fused_sample`]'s no-filter stochastic path takes the
-        /// Gumbel-max kernel: the backend supports it (GPU default device with
-        /// Metal or CUDA available) and `MLXCEL_SAMPLING_GUMBEL` is not falsy.
+        /// Gumbel-max kernel: the default device is the GPU, its backend has a
+        /// Gumbel-max port (Metal, CUDA or ROCm) and `MLXCEL_SAMPLING_GUMBEL`
+        /// is not falsy.
         /// The env value is read once per process.
         fn sampling_gumbel_available() -> bool;
+
+        /// The backend half of [`sampling_gumbel_available`], ignoring
+        /// `MLXCEL_SAMPLING_GUMBEL`: true when the default device is the GPU
+        /// and its backend has a Gumbel-max port.
+        fn sampling_gumbel_backend_supported() -> bool;
 
         /// Threadgroups the Gumbel-max kernel cooperates on one row with, for a
         /// `[batch, vocab]` launch. Always a power of two in `[1, 64]`. Exposed
@@ -2557,6 +2563,11 @@ mod ffi {
         /// min-p active) takes the rejection kernel: the backend supports it
         /// and `MLXCEL_SAMPLING_REJECTION` is not falsy. Read once per process.
         fn sampling_rejection_available() -> bool;
+
+        /// The backend half of [`sampling_rejection_available`], ignoring
+        /// `MLXCEL_SAMPLING_REJECTION`: true when the default device is the GPU
+        /// and its backend has a rejection-sampling port.
+        fn sampling_rejection_backend_supported() -> bool;
 
         /// Pure routing policy (#901): would `fused_sample` send this
         /// configuration to the rejection kernel, ignoring backend support and
@@ -3030,6 +3041,16 @@ mod ffi {
             upper: f32,
             shape: &[i32],
             dtype: i32,
+            key: *const MlxArray,
+        ) -> UniquePtr<MlxArray>;
+
+        /// Raw random words (`random::bits`): `width` bytes per element,
+        /// returned as uint32 / uint16 / uint8. A null `key` draws from the
+        /// default key sequence, which is how the fused samplers draw their
+        /// Philox key, so a test can recover the key a launch will use.
+        unsafe fn random_bits(
+            shape: &[i32],
+            width: i32,
             key: *const MlxArray,
         ) -> UniquePtr<MlxArray>;
 
@@ -3960,6 +3981,13 @@ mod sampling_gumbel_tests;
 #[cfg(test)]
 #[path = "sampling_rejection_tests.rs"]
 mod sampling_rejection_tests;
+
+// Fixed-key and graph-parity tests shared by every port of the two sampler
+// kernels (#2064): the kernel's draw recomputed from the key it consumed, and a
+// two-sample test against the graph sampler. GPU-only; they skip without a port.
+#[cfg(test)]
+#[path = "sampling_fixed_key_tests.rs"]
+mod sampling_fixed_key_tests;
 
 // Numeric-parity, Gemma `(1 + w)` convention, kill-switch and greedy-argmax
 // tests for the fused residual-add RMSNorm kernel (#905). GPU-only; they skip
