@@ -633,6 +633,100 @@ namespace {
         return holder;
     }
 
+    // ROCm port (issue #2067). Same computation, thread mapping, inputs,
+    // outputs, grid and template arguments as the CUDA port above; the body
+    // differs in the lane reduction only. `__shfl_down_sync` is a HIP
+    // compatibility shim that ignores its mask, so the native
+    // `__shfl_down(var, delta, width)` is used with the width stated. One
+    // (head, row) pair is reduced by the 32 lanes that share a `threadIdx.y`
+    // (the threadgroup is (32, 8, 1)), and the explicit width of 32 keeps the
+    // fold inside those 32 lanes: on a wave32 target (gfx11, gfx12) they are
+    // the whole wave, and on a wave64 target (CDNA) the width splits the wave
+    // into two 32-lane segments that are again exactly two rows.
+    static const char* SSM_HIP_SOURCE = R"(
+        // The wave32 guard every #1814 port carries (#2067 port
+        // requirements), spelled as the bitlinear port spells it because
+        // `static_assert(warpSize == 32)` does not compile in HIP. It is a
+        // no-op with ROCm 10's AMD clang 23, which defines neither macro for
+        // gfx1151, gfx942 or gfx90a. This fold does not rely on it: the
+        // shuffle width of 32 keeps it inside one row on wave64 as well.
+        #if defined(__AMDGCN_WAVEFRONT_SIZE__) && __AMDGCN_WAVEFRONT_SIZE__ != 32
+        #error "ssm_kernel_hip assumes a 32-lane wavefront"
+        #endif
+        #if defined(__AMDGCN_WAVEFRONT_SIZE) && __AMDGCN_WAVEFRONT_SIZE != 32
+        #error "ssm_kernel_hip assumes a 32-lane wavefront"
+        #endif
+        uint32_t n = blockIdx.z;                    // batch * heads
+        uint32_t h_idx = n % H;
+        uint32_t g_idx = n / G;
+        constexpr int n_per_t = Ds / 32;
+
+        // Wave-uniform: all 32 lanes of a wave share threadIdx.y.
+        uint32_t d_idx = blockIdx.y * blockDim.y + threadIdx.y;
+        if (d_idx >= (uint32_t)Dh) return;
+
+        auto x = X + n * Dh;
+        out += n * Dh;
+        auto i_state = state_in + n * Dh * Ds;
+        auto o_state = state_out + n * Dh * Ds;
+
+        auto C_ = C + g_idx * Ds;
+        auto B_ = B + g_idx * Ds;
+
+        uint32_t ds_idx = threadIdx.x;              // lane 0..31
+
+        float dt_ = (float)dt[n];
+        float A = -expf((float)A_log[h_idx]);
+        float dA = expf(A * dt_);
+
+        float acc = 0.0f;
+        float x_ = (float)x[d_idx];
+
+        for (int i = 0; i < n_per_t; ++i) {
+            int s_idx = n_per_t * (int)ds_idx + i;
+            int idx = (int)d_idx * Ds + s_idx;
+            float dB_by_x = x_ * dt_ * (float)B_[s_idx];
+            float state = dA * (float)i_state[idx] + dB_by_x;
+            o_state[idx] = (U)state;
+            acc += state * (float)C_[s_idx];
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            acc += __shfl_down(acc, o, 32);
+        }
+        if (ds_idx == 0u) {
+            out[d_idx] = (T)(acc + x_ * (float)D[h_idx]);
+        }
+    )";
+
+    struct SsmKernelHolderHip {
+        std::optional<mlx::core::fast::CustomKernelFunction> kernel;
+        bool initialized = false;
+
+        mlx::core::fast::CustomKernelFunction& get() {
+            if (!initialized) {
+#ifdef MLXCEL_BRIDGE_ROCM_BACKEND
+                kernel = mlx::core::fast::hip_kernel(
+                    "ssm_kernel_hip",
+                    {"X", "A_log", "B", "C", "D", "dt", "state_in"},
+                    {"out", "state_out"},
+                    SSM_HIP_SOURCE
+                );
+#else
+                throw std::runtime_error(
+                    "[ssm_update_kernel] this build has no ROCm backend");
+#endif
+                initialized = true;
+            }
+            return *kernel;
+        }
+    };
+
+    static SsmKernelHolderHip& get_ssm_kernel_hip() {
+        static SsmKernelHolderHip holder;
+        return holder;
+    }
+
 // This kernel's ports, in one place. `has_kernel_port` and `select_kernel_port`
 // both read it, so a support predicate and the dispatch cannot answer
 // differently (#1801).
@@ -644,8 +738,9 @@ const mlxcel::KernelPorts& ssm_ports() {
         .cuda = +[]() -> mlx::core::fast::CustomKernelFunction& {
             return get_ssm_kernel_cuda().get();
         },
-        // No HIP port yet (#1814).
-        .rocm = nullptr,
+        .rocm = +[]() -> mlx::core::fast::CustomKernelFunction& {
+            return get_ssm_kernel_hip().get();
+        },
     };
     return ports;
 }
@@ -1574,19 +1669,27 @@ std::unique_ptr<MlxArray> fused_moe_forward(
 }
 
 bool ssm_kernel_available() {
-#ifdef __APPLE__
-    return mlx::core::metal::is_available();
-#else
-    // CUDA port of the fused SSM decode kernel (#631); previously the hybrid
-    // SSM models fell back to the ~55-op graph path on every decode step.
-    // MLXCEL_SSM_CUDA_KERNEL=0 forces that graph path (debug / A-B bench).
-    if (const char* e = std::getenv("MLXCEL_SSM_CUDA_KERNEL")) {
-        if (e[0] == '0' && e[1] == '\0') {
+    // MLXCEL_SSM_KERNEL=0 forces the ~55-op ssm_step graph path on every
+    // backend (debug / A-B bench). MLXCEL_SSM_CUDA_KERNEL=0 is the name the
+    // switch had while the CUDA port (#631) was the only one off Apple; it is
+    // kept as an alias so existing scripts still work (#2067).
+    for (const char* name : {"MLXCEL_SSM_KERNEL", "MLXCEL_SSM_CUDA_KERNEL"}) {
+        const char* e = std::getenv(name);
+        if (e != nullptr && e[0] == '0' && e[1] == '\0') {
             return false;
         }
     }
-    return mlx::core::cu::is_available();
-#endif
+    // Custom kernels run only on the GPU stream; with MLXCEL_DEVICE=cpu the
+    // model gates then take the ssm_step graph on the CPU instead of the
+    // launch throwing (the same check as mamba1_scan_kernel_accepts).
+    if (mlx::core::default_device() != mlx::core::Device::gpu) {
+        return false;
+    }
+    // Otherwise read from the same table the dispatch in ssm_update_kernel
+    // selects from, so the Rust gates (`seq_len == 1 &&
+    // ssm_kernel_available()`) can `expect` the launch: a true here means
+    // select_kernel_port will not refuse.
+    return mlxcel::has_kernel_port(ssm_ports());
 }
 
 void ssm_update_kernel(
@@ -1605,6 +1708,11 @@ void ssm_update_kernel(
 ) {
     using namespace mlx::core;
 
+    if (hidden_states.inner.ndim() != 4 || B.inner.ndim() != 4) {
+        throw std::invalid_argument(
+            "[ssm_update_kernel] hidden_states and B must be rank 4 "
+            "([batch, 1, heads, head_dim] and [batch, 1, groups, state])");
+    }
     auto shape = hidden_states.inner.shape();
     int n = shape[0];  // batch
     int h = shape[2];  // num_heads
@@ -1612,6 +1720,25 @@ void ssm_update_kernel(
     auto b_shape = B.inner.shape();
     int hb = b_shape[2]; // n_groups
     int ds = b_shape[3]; // state_dim
+    // The kernel trusts these shapes as template constants and indexes raw
+    // buffers with them, so a checkpoint config the graph path would reject
+    // inside reshape/repeat (a state width that is not a multiple of 32, heads
+    // that do not divide into groups, a mismatched state) would read or leave
+    // unwritten GPU memory instead. Refuse it here; the bridge returns the
+    // throw to Rust as an error.
+    if (C.inner.shape() != B.inner.shape() || shape[1] != 1 ||
+        b_shape[0] != n || b_shape[1] != 1 || hb <= 0 || h % hb != 0 ||
+        ds < 32 || ds % 32 != 0 ||
+        A_log.inner.size() != static_cast<size_t>(h) ||
+        D.inner.size() != static_cast<size_t>(h) ||
+        dt.inner.size() != static_cast<size_t>(n) * h ||
+        state_in.inner.size() != static_cast<size_t>(n) * h * dh * ds) {
+        throw std::invalid_argument(
+            "[ssm_update_kernel] unsupported shapes for the fused SSM step "
+            "(single token, state width a multiple of 32, heads divisible by "
+            "groups, state [batch, heads, head_dim, state]); use the ssm_step "
+            "graph path");
+    }
     int g = h / hb;      // heads per group
 
     auto input_type = hidden_states.inner.dtype();
@@ -1636,6 +1763,19 @@ void ssm_update_kernel(
         {"H", h},
         {"G", g},
     };
+    // The CUDA and HIP JIT caches key a module on the kernel name plus this
+    // list, while the generated signature takes every input's runtime dtype,
+    // so an input whose dtype is not named here can reuse a module compiled
+    // for another dtype and read its buffer through the wrong pointer type
+    // (scripts/ci/check_kernel_dtype_keys.py). T and U cover X, D (cast to T
+    // below) and state_in, and dt is always float32 from compute_dt. A_log, B
+    // and C are not tied to T: Nemotron-H stores A_log in f32 next to bf16
+    // activations, granite in bf16 (#2067). The kernels never name TA, TB or
+    // TC, so this changes module names only, not the arithmetic; Metal
+    // already keys its name on every input dtype.
+    template_args.push_back({"TA", A_log.inner.dtype()});
+    template_args.push_back({"TB", B.inner.dtype()});
+    template_args.push_back({"TC", C.inner.dtype()});
 
     std::vector<array> inputs = {
         hidden_states.inner, A_log.inner, B.inner, C.inner,
