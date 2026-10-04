@@ -2316,9 +2316,11 @@ mod ffi {
         fn gpu_backend_available() -> bool;
 
         /// True when the resolved GPU backend has mlxcel's fused kernel ports,
-        /// that is Metal or CUDA (issue #1803). ROCm has a GPU but no ports
-        /// yet, so it answers `false` and callers take the MLX graph fallback
-        /// their family already has. This is deliberately narrower than
+        /// that is Metal or CUDA (issue #1803). ROCm has a GPU and HIP ports
+        /// for some kernels only (#1814), so it answers `false`; a ported
+        /// kernel's own predicate (for example `bitlinear_kernel_available`,
+        /// `fused_moe_kernels_available`) reads its port table and is what
+        /// gates it there. This is deliberately narrower than
         /// `gpu_backend_available`, which only says a GPU exists: conflating
         /// the two is what sent ROCm into `fast::cuda_kernel` and aborted the
         /// process.
@@ -2347,6 +2349,20 @@ mod ffi {
         /// *this* kernel" stopped being the same question the moment ROCm got
         /// its first port.
         fn bitlinear_kernel_available() -> bool;
+
+        /// True when this backend has both fused decode-MoE kernel ports
+        /// (gate-up and down), that is Metal, CUDA or ROCm (issues #1803,
+        /// #2065). Read from the kernels' own port tables, so the
+        /// `MLXCEL_FUSED_MOE` gate and the launchers behind it
+        /// ([`fused_moe_expert_kernel`], [`fused_moe_geglu_kernel`]) cannot
+        /// disagree.
+        fn fused_moe_kernels_available() -> bool;
+
+        /// True when this backend has the fused decode-MoE down kernel port
+        /// alone, which Nemotron-H's [`fused_moe_forward`] reuses for its fc2
+        /// (issue #2065). Its opt-in `MLXCEL_FUSED_MOE_RELU2` branch also needs
+        /// the fc1 squared-ReLU port and declines to `gather_qmm` without it.
+        fn moe_down_kernel_available() -> bool;
 
         /// Whether `quantized_matmul` for this transposed affine projection
         /// runs the same dense GEMM as `dequantize` + `matmul`, so the two
