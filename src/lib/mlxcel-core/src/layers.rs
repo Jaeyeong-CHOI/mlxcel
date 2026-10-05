@@ -845,6 +845,13 @@ fn dense_gemm(
 /// parallel block. Flip this constant only on a backend that measures a win.
 /// See `docs/benchmark_results/fused-norm-rope-m1ultra-2026-07-31.md` and
 /// `docs/benchmark_results/fused-add-rmsnorm-decode-m1ultra-2026-09-27.md`.
+///
+/// ROCm (#2063) measured the same: with the HIP port, whose output is
+/// byte-identical to the graph, Llama 3.1 8B decode on gfx1151 was 37.85 tok/s
+/// off and 37.95 on (medians of five), and Qwen2.5 7B gained 1.5% with a size
+/// that drifted between runs as much as the off arm's spread. Not a clear win,
+/// so ROCm keeps the shared default. See
+/// `docs/benchmark_results/rocm-fused-norm-rope-gfx1151-2026-10-05.md`.
 pub(crate) const FUSED_ADD_RMSNORM_DEFAULT: bool = false;
 
 /// Default for the fused q/k RoPE + KV-append-layout decode path. Same
@@ -857,6 +864,10 @@ pub(crate) const FUSED_ADD_RMSNORM_DEFAULT: bool = false;
 /// That is the single reproducible signal in the sweep and it points the wrong
 /// way, which is the stronger reason to leave this unwired until a backend or
 /// shape is found where it wins.
+///
+/// ROCm (#2063) did not find one: on gfx1151 Qwen2.5 7B decode gained 0.6% with
+/// this kernel alone and 1.7% with both fusions (medians of seven), inside the
+/// drift between runs. Same results page as [`FUSED_ADD_RMSNORM_DEFAULT`].
 pub(crate) const FUSED_ROPE_APPEND_DEFAULT: bool = false;
 
 /// Whether the fused residual-add + RMSNorm path (#905) is enabled.
@@ -1025,22 +1036,46 @@ pub fn graph_add_rms_norm<N: FusedAddRmsNormSpec + ?Sized>(
     (normed, new_residual)
 }
 
-/// Whether this backend has a fused-add-RMSNorm kernel, asked once.
+/// Whether the fused-add-RMSNorm kernel can run now: the default device is the
+/// GPU and the backend has a port (Metal, CUDA, ROCm since #2063).
 ///
-/// The FFI answer reaches `metal::is_available()` / `cu::is_available()` in
+/// The port half is asked once. The FFI answer reaches the backend probes in
 /// C++, and the backend cannot change mid-process, so re-asking at every
 /// residual join of every layer of every token would be pure overhead on the
-/// path the fusion exists to make cheaper.
+/// path the fusion exists to make cheaper. The device half is not cached: a
+/// custom kernel throws on the CPU stream, and `MLXCEL_DEVICE=cpu` or a
+/// `DefaultDeviceGuard` moves the default device, so it is read on every call
+/// (one FFI read of MLX's default device). The C++ predicate checks the device
+/// too, and another thread can move it between the two reads, so only a `true`
+/// answer is cached: a `false` taken in that window would otherwise switch the
+/// fusion off for the rest of the process.
 fn fused_add_rms_norm_backend_available() -> bool {
-    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *AVAILABLE.get_or_init(ffi::fused_add_rms_norm_available)
+    static PORTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    gpu_port_available(&PORTED, ffi::fused_add_rms_norm_available)
 }
 
-/// Whether this backend has a fused RoPE + append kernel, asked once. Same
-/// reasoning as [`fused_add_rms_norm_backend_available`].
+/// Whether the fused RoPE + append kernel can run now. Same split between a
+/// cached port check and a per-call device check as
+/// [`fused_add_rms_norm_backend_available`].
 fn fused_rope_append_backend_available() -> bool {
-    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *AVAILABLE.get_or_init(ffi::fused_rope_qk_append_available)
+    static PORTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    gpu_port_available(&PORTED, ffi::fused_rope_qk_append_available)
+}
+
+/// The GPU-default check, then `predicate`, which is asked until it first
+/// answers `true` and not after.
+fn gpu_port_available(ported: &std::sync::OnceLock<()>, predicate: fn() -> bool) -> bool {
+    if !ffi::default_device_is_gpu() {
+        return false;
+    }
+    if ported.get().is_some() {
+        return true;
+    }
+    let available = predicate();
+    if available {
+        let _ = ported.set(());
+    }
+    available
 }
 
 /// Whether the fused kernel can serve this call.
@@ -1049,8 +1084,9 @@ fn fused_rope_append_backend_available() -> bool {
 /// and an exception crossing the cxx boundary is not recoverable, so the
 /// eligibility test lives here and the fused branch is only taken when the
 /// launcher cannot throw: matching shapes and dtypes, a 1-D weight whose length
-/// is the trailing dimension, and a backend that has a custom-kernel JIT at all
-/// (false on a CPU-only build, and on ROCm until the ports land).
+/// is the trailing dimension, and a backend that has a port of this kernel on
+/// the current default device (false on a CPU-only build and on the CPU device
+/// of a GPU build).
 ///
 /// One class is no longer in that list. A backend with no port used to reach
 /// the Metal arm and abort; issue #1885 made the launcher refuse and its bridge
@@ -1065,7 +1101,11 @@ fn fused_add_rms_norm_eligible(delta: &MlxArray, residual: &MlxArray, weight: &M
     let Some(&trailing) = d_shape.last() else {
         return false;
     };
-    ffi::array_shape(weight)[0] == trailing
+    // An empty input would launch a zero-size grid, and a zero-width row would
+    // divide by zero in the launcher; the graph handles both.
+    trailing > 0
+        && d_shape.iter().all(|&d| d > 0)
+        && ffi::array_shape(weight)[0] == trailing
         && ffi::array_shape(residual) == d_shape
         && ffi::array_dtype(delta) == ffi::array_dtype(residual)
 }
@@ -3566,6 +3606,8 @@ impl FusedQKVLinear {
         let qkv = self.qkv_proj.project_concat(x);
         let qkv_shape = ffi::array_shape(&qkv);
         if qkv_shape.len() != 3
+            || qkv_shape[0] <= 0
+            || qkv_shape[1] <= 0
             || qkv_shape[2] != (self.n_heads + 2 * self.n_kv_heads) * self.head_dim
         {
             return None;
