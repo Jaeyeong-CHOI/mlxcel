@@ -61,7 +61,8 @@ use crate::server::types::anthropic_stream::{
 
 use super::chat::{
     MAX_TOOLS, SharedConstraint, build_chat_constraint, build_generate_options_with_live,
-    build_prompt_cache_request_context, parse_priority_header, validate_chat_tool_inputs,
+    build_prompt_cache_request_context, is_prompt_primed_open_thinking, parse_priority_header,
+    validate_chat_tool_inputs,
 };
 
 /// Render a media-capability rejection from the HTTP boundary in this route's
@@ -296,6 +297,8 @@ async fn non_stream_messages(
     // maps `tool_choice`, so an Anthropic `tool_choice: {"type": "none"}` lands as
     // `Mode("none")` and `effective_tools` drops the declarations here too.
     let amplified = chat_carries_loop_amplifier(&translated.chat_request);
+    let primed_open_thinking =
+        is_prompt_primed_open_thinking(&state.thinking_markers, &prepared.prompt);
     let mut options = build_generate_options_with_live(
         &translated.chat_request.params,
         &state.config,
@@ -313,6 +316,11 @@ async fn non_stream_messages(
     // native renderer closes. `None` for every template-rendered request.
     options.pre_rendered_prompt_tokens = prepared.prompt_token_ids.take();
     options.reasoning_budget = budget_override;
+    // The prompt may already leave generation inside an open thinking block
+    // (a template that primes `<think>\n`, #2123): the scheduler's
+    // `ThinkingState` then counts reasoning from the first token, as on
+    // `/v1/chat/completions`.
+    options.thinking_enter_block_on_start = primed_open_thinking;
     // Forced tool-call grammar (#1319), built at the request boundary.
     options.structured = structured;
     // Wire the cross-request prompt-prefix KV cache (epic #116) into the
@@ -493,6 +501,8 @@ async fn stream_messages(
     // maps `tool_choice`, so an Anthropic `tool_choice: {"type": "none"}` lands as
     // `Mode("none")` and `effective_tools` drops the declarations here too.
     let amplified = chat_carries_loop_amplifier(&translated.chat_request);
+    let primed_open_thinking =
+        is_prompt_primed_open_thinking(&state.thinking_markers, &prepared.prompt);
     let mut options = build_generate_options_with_live(
         &translated.chat_request.params,
         &state.config,
@@ -510,6 +520,11 @@ async fn stream_messages(
     // native renderer closes. `None` for every template-rendered request.
     options.pre_rendered_prompt_tokens = prepared.prompt_token_ids.take();
     options.reasoning_budget = budget_override;
+    // The prompt may already leave generation inside an open thinking block
+    // (a template that primes `<think>\n`, #2123): the scheduler's
+    // `ThinkingState` then counts reasoning from the first token, as on
+    // `/v1/chat/completions`.
+    options.thinking_enter_block_on_start = primed_open_thinking;
     // Forced tool-call grammar (#1319), built at the request boundary.
     options.structured = structured;
     // Wire the prompt-prefix KV cache (epic #116) into the streaming Anthropic
@@ -587,7 +602,14 @@ async fn stream_messages(
         );
         let accumulated_raw = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let acc_clone = accumulated_raw.clone();
-        let stream_filter = std::sync::Arc::new(std::sync::Mutex::new(StreamFilter::new()));
+        // A primed prompt starts the filter inside the thinking block, so the
+        // close-only trace streams as reasoning rather than answer text
+        // (#2123), matching the non-streaming split.
+        let stream_filter = std::sync::Arc::new(std::sync::Mutex::new(if primed_open_thinking {
+            StreamFilter::new_primed_open_thinking()
+        } else {
+            StreamFilter::new()
+        }));
         let filter_for_callback = stream_filter.clone();
         let emitter = std::sync::Arc::new(std::sync::Mutex::new(AnthropicBlockEmitter::new()));
         let emitter_for_callback = emitter.clone();
