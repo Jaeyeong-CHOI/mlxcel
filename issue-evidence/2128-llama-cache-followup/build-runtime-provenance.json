@@ -1,0 +1,41 @@
+{
+  "source_commit": "e466f5118b8e25d0c9a295ab017468db77b87313",
+  "archive_sha256": "137fdf0bd217aedf3f6315d8bb2f7f2ffb41fd5e20a2a17e2264d1fc886adce9",
+  "compiled_sdpa_sha256": "eba2c2a10761e2c1cc92790127136e00a51f585315a2e1511cc090f44887df64",
+  "source_equals_archive": true,
+  "binaries": [
+    {
+      "name": "mlxcel",
+      "sha256": "ab2c5de6129cbca32c4b4c6e041298ee5c97bc5c7ae3650c46d48d664c768edb",
+      "bytes": 107843056
+    },
+    {
+      "name": "mlxcel-server",
+      "sha256": "e9d52181962009218f539569802d5fc2a389fb607d18ffad2b14b2f41dfdc608",
+      "bytes": 105481608
+    }
+  ],
+  "cudnn_version_integer": 91300,
+  "cudnn_library_filename": "libcudnn.so.9",
+  "cudnn_library_sha256": "845b16d95726c5986782b04475d2de8dd1e159ae011a78cdf6b3b072cf0aac3d",
+  "runtime_provenance": "Version queried from same absolute cuDNN library path captured in all CLI process maps; path redacted.",
+  "mlx_dependency_revision": "81ba1c6a0e50a9268b931579c2d4f1158b9aab5a",
+  "cudnn_frontend_revision": "be6c079be8aaffa0fc079fcf039887e637c289c7",
+  "cuda_compiler_version": "13.0.88",
+  "cudnn_header_version": "9.13.0",
+  "cuda_architecture": "sm_121",
+  "build_command": [
+    "cargo",
+    "build",
+    "--locked",
+    "--release",
+    "--features",
+    "cuda",
+    "--bin",
+    "mlxcel",
+    "--bin",
+    "mlxcel-server",
+    "-j",
+    "2"
+  ]
+}
