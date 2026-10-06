@@ -38,14 +38,18 @@ struct Harness {
     app: axum::Router,
     handle: crate::server::model_provider::ScriptedStreamHandle,
     prompts: mpsc::Receiver<String>,
-    _options: mpsc::Receiver<crate::server::ServerGenerateOptions>,
+    options: mpsc::Receiver<crate::server::ServerGenerateOptions>,
 }
 
 fn harness() -> Harness {
-    harness_with_responses_store(false)
+    harness_with(JAMBA_TEMPLATE, false)
 }
 
 fn harness_with_responses_store(responses_store: bool) -> Harness {
+    harness_with(JAMBA_TEMPLATE, responses_store)
+}
+
+fn harness_with(template: &str, responses_store: bool) -> Harness {
     let (options_tx, options_rx) = mpsc::channel();
     let (prompt_tx, prompt_rx) = mpsc::channel();
     let (provider, handle) =
@@ -55,7 +59,7 @@ fn harness_with_responses_store(responses_store: bool) -> Harness {
     let state = AppState::new(
         provider,
         ServerConfig::default(),
-        ChatTemplateProcessor::with_template(JAMBA_TEMPLATE.to_string()),
+        ChatTemplateProcessor::with_template(template.to_string()),
         MlxcelTokenizer::stub(),
         PathBuf::from("route-test-model"),
         batch_metrics,
@@ -68,7 +72,7 @@ fn harness_with_responses_store(responses_store: bool) -> Harness {
         app: create_app(state),
         handle,
         prompts: prompt_rx,
-        _options: options_rx,
+        options: options_rx,
     }
 }
 
@@ -300,3 +304,6 @@ async fn responses_accepts_untyped_items_and_output_text_parts() {
         "{prompt:?}"
     );
 }
+
+#[path = "reasoning_echo_primed_stream_tests.rs"]
+mod primed_stream;
