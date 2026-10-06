@@ -1,0 +1,820 @@
+diff --git a/src/lib/mlx-cpp/patches/mlx/backend/cuda/scaled_dot_product_attention.cpp b/src/lib/mlx-cpp/patches/mlx/backend/cuda/scaled_dot_product_attention.cpp
+--- a/src/lib/mlx-cpp/patches/mlx/backend/cuda/scaled_dot_product_attention.cpp
++++ b/src/lib/mlx-cpp/patches/mlx/backend/cuda/scaled_dot_product_attention.cpp
+@@ -616,6 +616,20 @@
+ 
+   // cuDNN SDPA requires Ampere and later.
+   if (cu::device(s.device).compute_capability_major() < 8) {
++    return false;
++  }
++
++  // mlxcel #2128: fixed-input BF16 D_qk=128 single-query SDPA produced
++  // nondeterministic output on GB10 with cuDNN 9.13 and 9.24, including direct
++  // cuDNN execution without MLX or CUDA graphs. Route this shape class through
++  // the existing MLX vector/ops fallback; keep prefill and other types/dims.
++  // This is a mitigation, not a claim about every cuDNN version or GPU.
++  // Opt back into normal cuDNN eligibility only for diagnosis or a separately
++  // verified backend; remove this guard only after relevant regressions pass.
++  static bool enable_bf16_d128_decode =
++      env::get_var("MLXCEL_CUDNN_BF16_D128_DECODE", 0);
++  if (!enable_bf16_d128_decode && q.dtype() == bfloat16 &&
++      q.shape(2) == 1 && q.shape(-1) == 128) {
+     return false;
+   }
+ 
+diff --git a/tests/qwen3_long_determinism.rs b/tests/qwen3_long_determinism.rs
+new file mode 100644
+--- /dev/null
++++ b/tests/qwen3_long_determinism.rs
+@@ -0,0 +1,313 @@
++// Copyright 2025-2026 Lablup Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++//! Manual CUDA regression candidate for long Qwen3 trajectories (#2128).
++//!
++//! Uses the same 42 + 414 token schedule in three fresh-cache iterations;
++//! compares owned native logits bytes, not aliased MLX handles or just argmax.
++//! This eager teacher-forced path does not cover CLI/server async generation.
++//! No particular attention implementation or first divergent step is required.
++//!
++//! Required: MLXCEL_TEST_QWEN_MODEL_DIR (Qwen3 0.6B/1.7B, 4-bit/group64),
++//! MLXCEL_TEST_QWEN_JSONL (a NEW output file). Never downloads or skips a model.
++//! Run with --features cuda --test qwen3_long_determinism, then
++//! --ignored --exact qwen3_long_teacher_forced_logits_are_bitwise_deterministic
++//! --nocapture --test-threads=1. A zero-test invocation is NOT acceptance.
++
++#[test]
++#[ignore = "manual CUDA regression: explicit Qwen3 checkpoint and fresh JSONL output required"]
++fn qwen3_long_teacher_forced_logits_are_bitwise_deterministic() {
++    // Keep the test discoverable without CUDA: explicitly running it must fail,
++    // rather than silently becoming a successful zero-test CUDA gate.
++    #[cfg(not(feature = "cuda"))]
++    panic!("qwen3_long_determinism requires --features cuda");
++    #[cfg(feature = "cuda")]
++    cuda::run();
++}
++
++#[cfg(feature = "cuda")]
++mod cuda {
++    use std::collections::BTreeMap;
++    use std::fs::{self, File, OpenOptions};
++    use std::io::{BufWriter, Write};
++    use std::path::Path;
++
++    use mlxcel::LanguageModel;
++    use mlxcel_core::{MlxArray, UniquePtr, dtype};
++    use serde::Deserialize;
++    use serde_json::{Value, json};
++    use sha2::{Digest, Sha256};
++
++    const ITERATIONS: usize = 3;
++    const DECODE_STEPS: usize = 414;
++    const VOCAB: usize = 151_936;
++    const FIXTURE: &str = include_str!("fixtures/qwen3_long_determinism.json");
++
++    #[derive(Deserialize)]
++    struct Schedule {
++        schema: String,
++        prompt_ids: Vec<i32>,
++        decode_ids: Vec<i32>,
++    }
++
++    struct Snapshot {
++        bytes: Vec<u8>,
++        dtype: i32,
++    }
++
++    fn digest(bytes: &[u8]) -> String {
++        format!("{:x}", Sha256::digest(bytes))
++    }
++
++    fn emit(writer: &mut BufWriter<File>, event: Value) {
++        serde_json::to_writer(&mut *writer, &event).expect("write regression JSONL record");
++        writer.write_all(b"\n").expect("write JSONL newline");
++    }
++
++    fn checkpoint_config(path: &Path) -> Value {
++        let config: Value = serde_json::from_slice(
++            &fs::read(path.join("config.json")).expect("required checkpoint config.json"),
++        )
++        .expect("parse checkpoint config.json");
++        assert_eq!(config["model_type"], "qwen3", "requires dense Qwen3");
++        assert!(
++            matches!(config["hidden_size"].as_u64(), Some(1024) | Some(2048)),
++            "requires Qwen3 0.6B or 1.7B"
++        );
++        assert_eq!(config["vocab_size"].as_u64(), Some(VOCAB as u64));
++        assert_eq!(config["quantization"]["bits"].as_u64(), Some(4));
++        assert_eq!(config["quantization"]["group_size"].as_u64(), Some(64));
++        assert!(
++            path.join("tokenizer.json").is_file(),
++            "missing tokenizer.json"
++        );
++        let index: Value = serde_json::from_slice(
++            &fs::read(path.join("model.safetensors.index.json"))
++                .expect("required checkpoint weight index"),
++        )
++        .expect("parse weight index");
++        let weights = index["weight_map"].as_object().expect("weight_map object");
++        assert!(!weights.is_empty(), "empty checkpoint weight index");
++        for value in weights.values() {
++            let file = value.as_str().expect("weight shard filename");
++            assert!(path.join(file).is_file(), "missing checkpoint shard {file}");
++        }
++        config
++    }
++
++    fn snapshot(logits: &UniquePtr<MlxArray>, iteration: usize, step: usize) -> Snapshot {
++        mlxcel_core::eval(logits);
++        assert_eq!(
++            mlxcel_core::array_shape(logits),
++            [1, 1, VOCAB as i32],
++            "iteration {iteration}, step {step}: expected one complete last-position logit row"
++        );
++        let dtype = mlxcel_core::array_dtype(logits);
++        let bytes = mlxcel_core::array_to_raw_bytes(logits);
++        let size = match dtype {
++            dtype::BFLOAT16 | dtype::FLOAT16 => 2,
++            dtype::FLOAT32 => 4,
++            _ => panic!("iteration {iteration}, step {step}: unsupported logits dtype {dtype}"),
++        };
++        assert_eq!(
++            bytes.len(),
++            VOCAB * size,
++            "iteration {iteration}, step {step}: incomplete native logits snapshot"
++        );
++        // Inspect native exponent bits without adding a GPU cast/evaluation.
++        let finite = match dtype {
++            dtype::BFLOAT16 | dtype::FLOAT16 => {
++                let mask = if dtype == dtype::BFLOAT16 {
++                    0x7f80
++                } else {
++                    0x7c00
++                };
++                bytes
++                    .chunks_exact(2)
++                    .all(|b| u16::from_ne_bytes([b[0], b[1]]) & mask != mask)
++            }
++            dtype::FLOAT32 => bytes
++                .chunks_exact(4)
++                .all(|b| f32::from_ne_bytes([b[0], b[1], b[2], b[3]]).is_finite()),
++            _ => unreachable!(),
++        };
++        assert!(
++            finite,
++            "iteration {iteration}, step {step}: nonfinite native logits; no completed PASS"
++        );
++        Snapshot { bytes, dtype }
++    }
++
++    pub fn run() {
++        let model_dir = std::env::var("MLXCEL_TEST_QWEN_MODEL_DIR")
++            .expect("MLXCEL_TEST_QWEN_MODEL_DIR is required; no checkpoint skip/fallback");
++        let model_path = Path::new(&model_dir);
++        let config = checkpoint_config(model_path);
++        let artifact =
++            std::env::var("MLXCEL_TEST_QWEN_JSONL").expect("MLXCEL_TEST_QWEN_JSONL is required");
++        let schedule: Schedule =
++            serde_json::from_str(FIXTURE).expect("parse embedded token fixture");
++        assert_eq!(schedule.schema, "qwen3-long-determinism-v1");
++        assert_eq!(
++            schedule.prompt_ids.len(),
++            42,
++            "fixed prompt must not be shortened"
++        );
++        assert_eq!(
++            schedule.decode_ids.len(),
++            DECODE_STEPS,
++            "fixed decode must not be shortened"
++        );
++        assert!(
++            schedule
++                .prompt_ids
++                .iter()
++                .chain(&schedule.decode_ids)
++                .all(|&token| token >= 0 && (token as usize) < VOCAB),
++            "invalid fixture token ID"
++        );
++        let mut writer = BufWriter::new(
++            OpenOptions::new()
++                .write(true)
++                .create_new(true)
++                .open(&artifact)
++                .expect("create NEW regression JSONL; existing files are not replaced"),
++        );
++
++        // Same public startup helpers as the CLI, before model/GPU operations.
++        mlxcel_core::ensure_persistent_ptx_cache();
++        mlxcel_core::hardware::apply_metal_ops_per_buffer_default();
++        mlxcel_core::hardware::apply_cuda_graph_cache_default();
++        mlxcel_core::hardware::apply_cuda_sdpa_cache_default();
++        mlxcel_core::hardware::apply_cuda_graph_budget_default(Some(model_path));
++        let applied_tuning = mlxcel_core::autotune::ops::apply_tuned_cuda_kernel_env(
++            mlxcel_core::autotune::ops::cuda_kernel_knobs::TILE_M_CAP_BLACKWELL,
++        );
++        let runtime = mlxcel::initialize_runtime_checked().expect("initialize CUDA runtime");
++        assert!(
++            runtime.invalid_device_override.is_none(),
++            "invalid runtime device override"
++        );
++        assert!(
++            matches!(runtime.device, mlxcel::RuntimeDevice::Gpu)
++                && mlxcel_core::default_device_is_gpu(),
++            "CUDA regression cannot pass on a CPU fallback"
++        );
++        assert_eq!(
++            mlxcel_core::hardware::gpu_backend_kind(),
++            mlxcel_core::hardware::GpuBackendKind::Cuda,
++            "requires the actual NVIDIA CUDA backend, not another GPU backend"
++        );
++        let environment: BTreeMap<_, _> = [
++            "MLXCEL_DEVICE",
++            "MLX_USE_CUDA_GRAPHS",
++            "MLX_CUDA_USE_CUDNN_SDPA",
++            "MLXCEL_FORCE_SYNC",
++            "MLXCEL_FUSED_QK_NORM",
++            "MLXCEL_KV_INPLACE_WRITE",
++            "MLXCEL_AUTOTUNE",
++            "MLX_MAX_OPS_PER_BUFFER",
++            "MLX_MAX_MB_PER_BUFFER",
++        ]
++        .into_iter()
++        .filter_map(|key| std::env::var(key).ok().map(|value| (key, value)))
++        .collect();
++        emit(
++            &mut writer,
++            json!({
++                "event": "metadata", "schema": "qwen3-long-determinism-v1",
++                "model": model_dir, "config": config, "runtime": runtime.device.to_string(),
++                "iterations": ITERATIONS, "decode_steps": DECODE_STEPS, "prompt_tokens": 42,
++                "fixture_sha256": digest(FIXTURE.as_bytes()), "environment": environment,
++                "applied_tuning": applied_tuning, "scope": "eager teacher-forced native logits only"
++            }),
++        );
++        writer.flush().expect("flush metadata");
++
++        let (model, _) = mlxcel::load_model(model_path).expect("load required Qwen3 checkpoint");
++        let stream = mlxcel_core::streams::shared_thread_local_generation_stream();
++        mlxcel_core::streams::install_thread_local_default_stream(stream.as_ref());
++        let mut reference: Vec<Snapshot> = Vec::with_capacity(DECODE_STEPS + 1);
++        let mut first_failure = None;
++        let mut evaluated_rows = 0;
++        for iteration in 0..ITERATIONS {
++            model.reset_runtime_state();
++            let mut caches = model.make_caches();
++            let mut divergent_steps = 0;
++            for step in 0..=DECODE_STEPS {
++                let ids = if step == 0 {
++                    schedule.prompt_ids.as_slice()
++                } else {
++                    &schedule.decode_ids[step - 1..step]
++                };
++                let input = mlxcel_core::from_slice_i32(ids, &[1, ids.len() as i32]);
++                let logits = if step == 0 {
++                    model.forward_last_logits(&input, &mut caches, None, ids.len() - 1)
++                } else {
++                    model.forward(&input, &mut caches, None)
++                };
++                let current = snapshot(&logits, iteration, step);
++                let matches = iteration == 0
++                    || (current.dtype == reference[step].dtype
++                        && current.bytes == reference[step].bytes);
++                if !matches {
++                    divergent_steps += 1;
++                    let first_byte = reference[step]
++                        .bytes
++                        .iter()
++                        .zip(&current.bytes)
++                        .position(|(a, b)| a != b);
++                    first_failure.get_or_insert((iteration, step, 42 + step, first_byte));
++                }
++                emit(
++                    &mut writer,
++                    json!({
++                        "event": "step", "iteration": iteration, "step": step,
++                        "context_tokens": 42 + step, "shape": [1, 1, VOCAB],
++                        "dtype": current.dtype, "native_bytes": current.bytes.len(),
++                        "native_sha256": digest(&current.bytes), "finite": true,
++                        "matches_iteration0": matches
++                    }),
++                );
++                if iteration == 0 {
++                    reference.push(current);
++                }
++                evaluated_rows += 1;
++                if step % 32 == 0 {
++                    writer.flush().expect("flush step evidence");
++                }
++            }
++            mlxcel_core::synchronize_default();
++            emit(
++                &mut writer,
++                json!({"event": "iteration_summary", "iteration": iteration,
++                "evaluated_steps": DECODE_STEPS + 1, "divergent_steps": divergent_steps}),
++            );
++            writer.flush().expect("flush iteration evidence");
++        }
++        assert_eq!(evaluated_rows, ITERATIONS * (DECODE_STEPS + 1));
++        emit(
++            &mut writer,
++            json!({"event": "final_summary", "complete": true,
++            "evaluated_rows": evaluated_rows, "iterations": ITERATIONS,
++            "steps_per_iteration": DECODE_STEPS + 1, "first_failure": first_failure,
++            "pass": first_failure.is_none()}),
++        );
++        writer.flush().expect("flush complete regression result");
++        assert!(
++            first_failure.is_none(),
++            "Qwen3 native logits differ: first (iteration, step, context, byte)={first_failure:?}; artifact={artifact}"
++        );
++    }
++}
+diff --git a/tests/fixtures/qwen3_long_determinism.json b/tests/fixtures/qwen3_long_determinism.json
+new file mode 100644
+--- /dev/null
++++ b/tests/fixtures/qwen3_long_determinism.json
+@@ -0,0 +1,473 @@
++{
++  "schema": "qwen3-long-determinism-v1",
++  "provenance": {
++    "issue": "https://github.com/lablup/mlxcel/issues/2128",
++    "source_commit": "d253154c0e6ec8ce8056d69153543ca3993c5314",
++    "source_run": "baseline-001/Qwen3-1.7B-4bit/default/run-01",
++    "source_model": "mlx-community/Qwen3-1.7B-4bit",
++    "source_model_revision": "3b1b1768f8f8cf8351c712464f906e86c2b8269e",
++    "prompt_ids_file_sha256": "c6cef4b7565c5198465eac6419b62bca05e8b3717472250ed3c5049539b8652f",
++    "decode_ids_file_sha256": "226cad854f558f9622533f7581a6d1e5d24ff3eb7c7a813bc028a6f500ac8533",
++    "notes": "Exact unmodified 42-token prompt and 414 generated IDs. All fixed IDs are consumed without EOS early termination; IDs are not golden expected output. Shared vocabulary permits both Qwen3 0.6B and 1.7B; the final minimal test must establish sensitivity separately per model."
++  },
++  "prompt_ids": [
++    151644,
++    872,
++    198,
++    7985,
++    264,
++    2805,
++    3364,
++    315,
++    911,
++    220,
++    21,
++    15,
++    15,
++    4244,
++    911,
++    264,
++    326,
++    57909,
++    53416,
++    879,
++    13719,
++    264,
++    1943,
++    304,
++    264,
++    16486,
++    13,
++    5443,
++    42020,
++    714,
++    14396,
++    4128,
++    13,
++    608,
++    2152,
++    5854,
++    766,
++    151645,
++    198,
++    151644,
++    77091,
++    198
++  ],
++  "decode_ids": [
++    151667,
++    271,
++    151668,
++    271,
++    785,
++    326,
++    57909,
++    53416,
++    11,
++    85656,
++    11,
++    1030,
++    7391,
++    806,
++    2272,
++    518,
++    279,
++    6821,
++    315,
++    279,
++    1879,
++    13,
++    576,
++    9396,
++    572,
++    806,
++    4238,
++    11,
++    279,
++    16876,
++    806,
++    21741,
++    11,
++    323,
++    279,
++    3100,
++    518,
++    279,
++    1909,
++    315,
++    279,
++    21271,
++    806,
++    1172,
++    21741,
++    13,
++    1260,
++    1030,
++    3884,
++    17727,
++    2525,
++    323,
++    728,
++    11,
++    862,
++    40198,
++    82,
++    63337,
++    553,
++    279,
++    6319,
++    11,
++    862,
++    85005,
++    21145,
++    553,
++    279,
++    9956,
++    13,
++    1988,
++    4302,
++    1410,
++    10549,
++    1435,
++    369,
++    279,
++    1899,
++    566,
++    1730,
++    279,
++    1943,
++    304,
++    264,
++    16486,
++    382,
++    2132,
++    572,
++    264,
++    9255,
++    11,
++    17545,
++    6556,
++    979,
++    279,
++    9956,
++    6009,
++    311,
++    1246,
++    75,
++    13,
++    85656,
++    1030,
++    1012,
++    389,
++    279,
++    9530,
++    369,
++    4115,
++    11,
++    40971,
++    279,
++    9278,
++    504,
++    279,
++    21944,
++    11,
++    979,
++    566,
++    13686,
++    432,
++    13,
++    362,
++    16486,
++    11,
++    2310,
++    323,
++    42839,
++    11,
++    40119,
++    389,
++    279,
++    9798,
++    13,
++    1260,
++    12771,
++    432,
++    705,
++    11,
++    279,
++    2383,
++    53334,
++    11,
++    279,
++    2062,
++    7402,
++    13,
++    27368,
++    11,
++    264,
++    5185,
++    11,
++    5326,
++    304,
++    264,
++    1424,
++    566,
++    3207,
++    1405,
++    15282,
++    382,
++    64110,
++    1249,
++    279,
++    53416,
++    879,
++    15634,
++    279,
++    3100,
++    11,
++    358,
++    1079,
++    5558,
++    13,
++    576,
++    9396,
++    702,
++    4429,
++    752,
++    11,
++    714,
++    358,
++    2115,
++    264,
++    1943,
++    13,
++    576,
++    3100,
++    374,
++    2058,
++    1588,
++    11,
++    323,
++    358,
++    686,
++    1477,
++    498,
++    1189,
++    21518,
++    36,
++    71829,
++    1349,
++    432,
++    10917,
++    11,
++    1221,
++    2326,
++    3039,
++    13,
++    1260,
++    1030,
++    3884,
++    6605,
++    1573,
++    2293,
++    5565,
++    973,
++    11,
++    68838,
++    11,
++    1496,
++    264,
++    2421,
++    504,
++    279,
++    13627,
++    315,
++    264,
++    8284,
++    429,
++    1030,
++    58481,
++    13,
++    1988,
++    419,
++    825,
++    6476,
++    2155,
++    13,
++    1084,
++    572,
++    537,
++    264,
++    38967,
++    11,
++    537,
++    264,
++    9958,
++    13,
++    1084,
++    572,
++    264,
++    34855,
++    11,
++    264,
++    11222,
++    382,
++    1519,
++    7877,
++    806,
++    6414,
++    11,
++    323,
++    369,
++    264,
++    4445,
++    11,
++    566,
++    572,
++    1182,
++    304,
++    279,
++    9396,
++    11,
++    304,
++    279,
++    6319,
++    11,
++    304,
++    279,
++    1992,
++    1380,
++    279,
++    3100,
++    572,
++    8791,
++    311,
++    8474,
++    13,
++    1260,
++    1030,
++    902,
++    4522,
++    1380,
++    279,
++    1943,
++    1030,
++    2525,
++    504,
++    11,
++    714,
++    566,
++    6876,
++    432,
++    572,
++    1931,
++    13,
++    1260,
++    6876,
++    432,
++    572,
++    8791,
++    369,
++    1435,
++    382,
++    4792,
++    3729,
++    11,
++    85656,
++    13020,
++    264,
++    37799,
++    323,
++    14638,
++    518,
++    279,
++    21271,
++    748,
++    6821,
++    13,
++    1260,
++    50300,
++    279,
++    4244,
++    448,
++    806,
++    19225,
++    11,
++    323,
++    304,
++    429,
++    4445,
++    11,
++    566,
++    15985,
++    13,
++    576,
++    9396,
++    1030,
++    4429,
++    1045,
++    11,
++    714,
++    537,
++    678,
++    13,
++    1597,
++    279,
++    3100,
++    1035,
++    1477,
++    1105,
++    11,
++    1101,
++    438,
++    432,
++    1030,
++    1730,
++    1435,
++    382,
++    1519,
++    2182,
++    279,
++    16486,
++    1182,
++    11,
++    323,
++    504,
++    429,
++    1899,
++    389,
++    11,
++    279,
++    326,
++    57909,
++    53416,
++    6116,
++    264,
++    2632,
++    803,
++    1091,
++    264,
++    53416,
++    13,
++    1260,
++    6116,
++    264,
++    53416,
++    315,
++    6605,
++    11,
++    264,
++    53416,
++    315,
++    3900,
++    11,
++    323,
++    264,
++    53416,
++    315,
++    279,
++    9396,
++    748,
++    23594,
++    13
++  ]
++}
