@@ -35,42 +35,6 @@ rocblas_datatype to_rocblas_dtype(Dtype dtype) {
   }
 }
 
-int parse_non_negative_int_env(const char* env_name, int default_value) {
-  const char* raw = std::getenv(env_name);
-  if (raw == nullptr || *raw == '\0') {
-    return default_value;
-  }
-
-  char* end = nullptr;
-  long value = std::strtol(raw, &end, 10);
-  if (end == raw || *end != '\0' || value < 0) {
-    return default_value;
-  }
-  return static_cast<int>(value);
-}
-
-int gemm_solution_index_f32(bool batched) {
-  static int single_index =
-      parse_non_negative_int_env("MLX_ROCM_GEMM_F32_SOLUTION_INDEX", 0);
-  static int batched_index = parse_non_negative_int_env(
-      "MLX_ROCM_GEMM_F32_BATCHED_SOLUTION_INDEX", -1);
-  if (!batched) {
-    return single_index;
-  }
-  return batched_index >= 0 ? batched_index : single_index;
-}
-
-int gemm_solution_index_bf16(bool batched) {
-  static int single_index =
-      parse_non_negative_int_env("MLX_ROCM_GEMM_BF16_SOLUTION_INDEX", 0);
-  static int batched_index = parse_non_negative_int_env(
-      "MLX_ROCM_GEMM_BF16_BATCHED_SOLUTION_INDEX", -1);
-  if (!batched) {
-    return single_index;
-  }
-  return batched_index >= 0 ? batched_index : single_index;
-}
-
 } // namespace
 
 void rocblas_gemm(

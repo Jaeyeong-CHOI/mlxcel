@@ -4,9 +4,11 @@
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/rocm/allocator.h"
 #include "mlx/backend/rocm/device.h"
+#include "mlx/backend/rocm/env_int.h"
 #include "mlx/backend/rocm/gemms/gemv.h"
 #include "mlx/backend/rocm/gemms/hipblaslt_gemm.h"
 #include "mlx/backend/rocm/gemms/naive_gemm.h"
+#include "mlx/backend/rocm/gemms/rocblas_gemm.h"
 #include "mlx/backend/rocm/kernel_utils.hpp"
 #include "mlx/backend/rocm/utils.h"
 #include "mlx/primitives.h"
@@ -19,6 +21,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <numeric>
 #include <string>
 #include <vector>
@@ -175,42 +178,6 @@ std::pair<bool, int64_t> get_uniform_batch_stride(
   return {true, batch_strides.back()};
 }
 
-int parse_non_negative_int_env(const char* env_name, int default_value) {
-  const char* raw = std::getenv(env_name);
-  if (raw == nullptr || *raw == '\0') {
-    return default_value;
-  }
-
-  char* end = nullptr;
-  long value = std::strtol(raw, &end, 10);
-  if (end == raw || *end != '\0' || value < 0) {
-    return default_value;
-  }
-  return static_cast<int>(value);
-}
-
-int gemm_solution_index_f32(bool batched) {
-  static int single_index =
-      parse_non_negative_int_env("MLX_ROCM_GEMM_F32_SOLUTION_INDEX", 0);
-  static int batched_index = parse_non_negative_int_env(
-      "MLX_ROCM_GEMM_F32_BATCHED_SOLUTION_INDEX", -1);
-  if (!batched) {
-    return single_index;
-  }
-  return batched_index >= 0 ? batched_index : single_index;
-}
-
-int gemm_solution_index_bf16(bool batched) {
-  static int single_index =
-      parse_non_negative_int_env("MLX_ROCM_GEMM_BF16_SOLUTION_INDEX", 0);
-  static int batched_index = parse_non_negative_int_env(
-      "MLX_ROCM_GEMM_BF16_BATCHED_SOLUTION_INDEX", -1);
-  if (!batched) {
-    return single_index;
-  }
-  return batched_index >= 0 ? batched_index : single_index;
-}
-
 void gemm_rocblas(
     rocm::CommandEncoder& encoder,
     int M,
@@ -278,7 +245,7 @@ void gemm_rocblas(
       case float32: {
         float alpha_f = alpha;
         float beta_f = beta;
-        int solution_index = gemm_solution_index_f32(false);
+        int solution_index = rocm::gemm_solution_index_f32(false);
         static std::atomic<bool> solution_valid{true};
 
         if (solution_index > 0 &&
@@ -394,7 +361,7 @@ void gemm_rocblas(
       case bfloat16: {
         float alpha_f = alpha;
         float beta_f = beta;
-        int solution_index = gemm_solution_index_bf16(false);
+        int solution_index = rocm::gemm_solution_index_bf16(false);
         static std::atomic<bool> solution_valid{true};
 
         rocblas_gemm_algo algo = rocblas_gemm_algo_standard;
@@ -536,7 +503,7 @@ void gemm_strided_batched_rocblas(
       case float32: {
         float alpha_f = alpha;
         float beta_f = beta;
-        int solution_index = gemm_solution_index_f32(true);
+        int solution_index = rocm::gemm_solution_index_f32(true);
         static std::atomic<bool> solution_valid{true};
 
         if (solution_index > 0 &&
@@ -672,7 +639,7 @@ void gemm_strided_batched_rocblas(
       case bfloat16: {
         float alpha_f = alpha;
         float beta_f = beta;
-        int solution_index = gemm_solution_index_bf16(true);
+        int solution_index = rocm::gemm_solution_index_bf16(true);
         static std::atomic<bool> solution_valid{true};
 
         rocblas_gemm_algo algo = rocblas_gemm_algo_standard;
@@ -1211,14 +1178,12 @@ static bool sorted_gather_enabled() {
 // Minimum average tokens per distinct expert run to prefer segment GEMMs over
 // gemv_gather. Default 1: even short runs use tiled GEMM (large K×N MoE).
 static int moe_segment_min_avg() {
-  static const int v = [] {
-    const char* e = std::getenv("MLX_ROCM_MOE_SEG_MIN");
-    if (!e || !*e)
-      return 1;
-    char* end = nullptr;
-    long x = std::strtol(e, &end, 10);
-    return (end != e && x >= 1) ? static_cast<int>(x) : 1;
-  }();
+  static const int v = rocm::env_int_or_default(
+      "MLX_ROCM_MOE_SEG_MIN",
+      1,
+      1,
+      std::numeric_limits<int>::max(),
+      "a positive integer");
   return v;
 }
 
