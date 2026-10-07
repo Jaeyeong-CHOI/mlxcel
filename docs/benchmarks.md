@@ -60,6 +60,7 @@ reference runtime) live alongside the snapshot:
 - [Gemma3n decode profile: is a compiled fusion justified?](benchmark_results/gemma3n-decode-profile.md)
 - [Gemma3n decode profile on M5 Max](benchmark_results/gemma3n-decode-profile-m5max.md)
 - [Gemma 4 31B QAT/non-QAT MTP exactness on M5 Max](benchmark_results/gemma4-31b-mtp-exactness-2026-09-26.md)
+- [Unified engine baseline: CLI vs server B=1 decode, prefill chunk and KV storage (GB10)](benchmark_results/unified-engine-baseline-gb10-2026-10-07.md)
 
 Embedding and rerank throughput (`/v1/embeddings`, `/v1/rerank`) has its own
 ladder, driven by `scripts/bench_embeddings.py`:
@@ -170,6 +171,24 @@ python3 scripts/bench_embeddings.py --bin target/release/mlxcel-server \
 # Continuous-batching sweep over every model dir. Takes ONE positional
 # argument, the output log path, and no flags.
 ./scripts/bench_all_models.sh <output_file>
+
+# Single-stream (B=1) decode, CLI path (CxxGenerator) next to the server path
+# (the BatchScheduler, driven in-process), at a 256- and an 8192-token prompt.
+# One pass is a functional check; for numbers use the interleaved rounds with a
+# null arm. ADR 0007 lists the baseline and A/B commands it is decided by.
+make bench-engine MODEL=models/mlx/qwen3-1.7b-4bit
+scripts/engine_bench_rounds.py --model models/mlx/qwen3-1.7b-4bit --rounds 5 \
+    --null-every-arm --arm cli="--path cli" --arm server="--path server" \
+    --out baseline-qwen.jsonl
+# Each benchmark process is killed after --run-timeout seconds (default 3600,
+# 0 disables). Arm names ending in -null are reserved for the generated null
+# arms and are rejected.
+
+# CLI vs server token parity (first divergent token per pair), same prompt and
+# SamplingConfig, B=1 dense and paged, MLXCEL_SDPA_DETERMINISTIC=1. The prompt
+# must render to at least two tokens (one with --no-prompt-cache-case); an
+# empty or one-token prompt is rejected before any model loads.
+make engine-parity MODEL=models/mlx/qwen3-1.7b-4bit
 
 # Sampling step, no model attached. Gumbel-max (#900) covers the no-filter
 # path; the rejection kernel (#901) covers top-k / top-p / min-p.
