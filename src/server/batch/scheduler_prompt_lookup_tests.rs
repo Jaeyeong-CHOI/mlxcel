@@ -109,6 +109,13 @@ fn cycle_llama() -> crate::models::Llama3Model {
 /// A scheduler over the cycle model; `max_batch` is
 /// `--prompt-lookup-max-batch`, `None` runs without prompt lookup.
 fn scheduler(max_batch: Option<usize>) -> BatchScheduler {
+    scheduler_with_storage(max_batch, DecodeStorageBackend::Dense)
+}
+
+fn scheduler_with_storage(
+    max_batch: Option<usize>,
+    storage: DecodeStorageBackend,
+) -> BatchScheduler {
     let (_tx, rx) = mpsc::channel();
     let mut sched = BatchScheduler::with_config(
         crate::LoadedModel::Llama(cycle_llama()),
@@ -123,7 +130,7 @@ fn scheduler(max_batch: Option<usize>) -> BatchScheduler {
         false,
         PreemptionPolicy::default(),
         1,
-        DecodeStorageBackend::Dense,
+        storage,
     );
     if let Some(max_batch) = max_batch {
         sched = sched.with_speculative_dispatch(crate::server::SpeculativeDispatch::PromptLookup {
@@ -931,4 +938,269 @@ fn a_cancel_during_a_round_finalizes_after_the_round() {
     assert_eq!(tick(&mut sched, &mut done), Tick::Idle);
     let (proposed, _) = acceptance(&rx).expect("the round ran before the cancel took effect");
     assert!(proposed > 0, "a verify round ran in the cancelled tick");
+}
+
+/// Exercise the production resolver so this regression covers the server's
+/// opt-in settings as well as the governor and scheduler integration.
+#[cfg(feature = "cuda")]
+fn break_even_scheduler() -> BatchScheduler {
+    let config = crate::server::config::ServerConfig {
+        draft_kind: Some("prompt-lookup".to_string()),
+        ..Default::default()
+    };
+    let mut dispatch =
+        crate::server::SpeculativeDispatch::resolve(&config, std::path::Path::new("unused"))
+            .expect("token-only dispatch needs no checkpoint");
+    if let crate::server::SpeculativeDispatch::PromptLookup { config, .. } = &mut dispatch {
+        config.ngram_max = 2;
+    }
+    scheduler(None).with_speculative_dispatch(dispatch)
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn low_yield_verify_rounds_pause_pipeline_and_resume_on_copy() {
+    let mut sched = break_even_scheduler();
+    let mut done = Done::new();
+    // Every true bigram continues with one correct token and then an error.
+    // Use bigram lookup to land exactly one proposal. Once decoding
+    // has written its own cycle, a long shadow match can recover copying.
+    let prompt = low_yield_prompt();
+    let rx = enqueue(&mut sched, &prompt, 80);
+    assert_eq!(tick(&mut sched, &mut done), Tick::Prefill);
+    let id = only_row(&sched);
+    let mut paused_after = None;
+    let mut pipelined_while_paused = 0;
+    let mut resumed = false;
+    for _ in 0..100 {
+        if tick(&mut sched, &mut done) == Tick::Idle {
+            break;
+        }
+        let Some(seq) = sched.active_batch.get(id) else {
+            continue;
+        };
+        let stats = seq
+            .prompt_lookup
+            .as_ref()
+            .expect("eligible row")
+            .drafter
+            .stats();
+        if stats.paused_rounds > 0 && paused_after.is_none() {
+            assert_eq!(stats.drafted_rounds, 2, "two low-yield verifies pause");
+            assert_eq!(
+                stats.accepted_draft_tokens, 2,
+                "one token landed each round"
+            );
+            paused_after = Some(stats.drafted_rounds);
+        }
+        if let Some(rounds) = paused_after {
+            if stats.drafted_rounds == rounds && sched.decode_lookahead.is_some() {
+                pipelined_while_paused += 1;
+            }
+            if stats.shadow_confirmations > 0 && stats.drafted_rounds > rounds {
+                resumed = true;
+            }
+        }
+    }
+    assert!(
+        paused_after.is_some(),
+        "low-yield rounds must pause (fails without server rule)"
+    );
+    assert!(
+        pipelined_while_paused >= 2,
+        "paused row promptly returns to actual lookahead ticks"
+    );
+    assert!(
+        resumed,
+        "shadow evidence restores actual verification on a copy stretch"
+    );
+    assert_eq!(tokens_of(&done, &prompt), cycle_from(0, 80));
+    let (proposed, accepted) = acceptance(&rx).expect("verify counters");
+    assert!(accepted > 2 && accepted <= proposed);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn server_break_even_keeps_copy_heavy_rows_verifying() {
+    let mut sched = break_even_scheduler();
+    let mut done = Done::new();
+    let prompt = copy_prompt();
+    let rx = enqueue(&mut sched, &prompt, 64);
+    assert_eq!(tick(&mut sched, &mut done), Tick::Prefill);
+    let id = only_row(&sched);
+    let mut verified = 0;
+    for _ in 0..100 {
+        if tick(&mut sched, &mut done) == Tick::Idle {
+            break;
+        }
+        if let Some(seq) = sched.active_batch.get(id) {
+            let stats = seq
+                .prompt_lookup
+                .as_ref()
+                .expect("eligible row")
+                .drafter
+                .stats();
+            assert_eq!(
+                stats.paused_rounds, 0,
+                "copy evidence stays above break-even"
+            );
+            if stats.drafted_rounds > verified {
+                assert!(
+                    sched.decode_lookahead.is_none(),
+                    "copy round really verified synchronously"
+                );
+                verified = stats.drafted_rounds;
+            }
+        }
+    }
+    assert!(verified >= 4);
+    assert_eq!(tokens_of(&done, &prompt), cycle_from(4, 64));
+    let (proposed, accepted) = acceptance(&rx).expect("copy counters");
+    assert!(accepted > 32 && accepted <= proposed);
+}
+
+#[cfg(feature = "cuda")]
+fn low_yield_prompt() -> Vec<i32> {
+    let mut prompt = Vec::new();
+    for t in 0..VOCAB {
+        prompt.extend([
+            t as i32,
+            ((t + 1) % VOCAB) as i32,
+            ((t + 2) % VOCAB) as i32,
+            ((t + 7) % VOCAB) as i32,
+        ]);
+    }
+    prompt.extend([14, 15]);
+    prompt
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn break_even_evidence_is_per_row_while_a_copy_peer_keeps_the_tick_synchronous() {
+    let mut sched = break_even_scheduler();
+    let mut done = Done::new();
+    let copy = copy_prompt();
+    let low = low_yield_prompt();
+    let _copy_rx = enqueue(&mut sched, &copy, 128);
+    assert_eq!(tick(&mut sched, &mut done), Tick::Prefill);
+    let copy_id = only_row(&sched);
+    let _low_rx = enqueue(&mut sched, &low, 80);
+    assert_eq!(tick(&mut sched, &mut done), Tick::Prefill);
+    let low_id = sched
+        .active_batch
+        .iter_sequences()
+        .find(|seq| seq.prompt_tokens == low)
+        .expect("low-yield row admitted")
+        .seq_id;
+    let mut observed_pause = false;
+    for _ in 0..10 {
+        assert_eq!(tick(&mut sched, &mut done), Tick::Decode);
+        let low_stats = sched
+            .active_batch
+            .get(low_id)
+            .expect("low row active")
+            .prompt_lookup
+            .as_ref()
+            .expect("low drafter")
+            .drafter
+            .stats();
+        let copy_stats = sched
+            .active_batch
+            .get(copy_id)
+            .expect("copy row active")
+            .prompt_lookup
+            .as_ref()
+            .expect("copy drafter")
+            .drafter
+            .stats();
+        assert_eq!(
+            copy_stats.paused_rounds, 0,
+            "peer low yield cannot pause copying"
+        );
+        if low_stats.paused_rounds > 0 {
+            assert_eq!(low_stats.drafted_rounds, 2);
+            assert!(copy_stats.drafted_rounds >= 3);
+            assert!(
+                sched.decode_lookahead.is_none(),
+                "copy peer still verifies on the shared tick"
+            );
+            observed_pause = true;
+            break;
+        }
+    }
+    assert!(observed_pause);
+    drain(&mut sched, &mut done);
+    assert_eq!(tokens_of(&done, &copy), cycle_from(4, 128));
+    assert_eq!(tokens_of(&done, &low), cycle_from(0, 80));
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn server_reprimes_after_the_first_proposal_free_ask() {
+    let mut sched = break_even_scheduler();
+    let mut done = Done::new();
+    let _rx = enqueue(&mut sched, PLAIN_PROMPT, 12);
+    assert_eq!(tick(&mut sched, &mut done), Tick::Prefill);
+    assert_eq!(tick(&mut sched, &mut done), Tick::Decode);
+    assert!(sched.decode_lookahead.is_some());
+    drain(&mut sched, &mut done);
+    assert_eq!(tokens_of(&done, PLAIN_PROMPT), cycle_from(9, 12));
+}
+
+/// The cap is on total context, including generated tokens. Exercise the
+/// real scheduler admission query with an allocated paged/dense sequence;
+/// query-only lengths avoid allocating long attention fixtures. Restore
+/// the actual token state before running another model step.
+#[test]
+fn paged_prompt_lookup_cap_covers_measured_continuation_and_stops_at_boundary() {
+    use mlxcel_core::cache::SequenceStateBackend;
+
+    for storage in [DecodeStorageBackend::Paged, DecodeStorageBackend::Dense] {
+        let mut sched = scheduler_with_storage(Some(2), storage);
+        let mut done = Done::new();
+        let prompt = copy_prompt();
+        let _rx = enqueue(&mut sched, &prompt, 1024);
+        assert_eq!(tick(&mut sched, &mut done), Tick::Prefill);
+        let id = only_row(&sched);
+        let expected_backend = if storage == DecodeStorageBackend::Paged {
+            SequenceStateBackend::PagedKvCache
+        } else {
+            SequenceStateBackend::DenseKvCache
+        };
+        assert_eq!(
+            sched.engine.pool().get(id).expect("allocated row").backend,
+            expected_backend
+        );
+        let generated = sched
+            .active_batch
+            .get(id)
+            .expect("row")
+            .generated_tokens
+            .clone();
+        for (prompt_len, generated_len, paged_admitted) in [
+            (4099, 1, true),
+            (4101, 1, true),
+            (4102, 256, true), // 4358 total: the measured request envelope.
+            (4607, 1, true),   // Exact 4608 boundary is inclusive.
+            (4608, 1, false),
+            (4102, 507, false), // The continuation also crosses the cap.
+            (8192, 1, false),
+        ] {
+            let seq = sched.active_batch.get_mut(id).expect("row");
+            seq.prompt_tokens.resize(prompt_len, 0);
+            seq.generated_tokens.resize(generated_len, 0);
+            let admitted = sched.prompt_lookup_tick_applies(&[id]);
+            assert_eq!(
+                admitted,
+                storage == DecodeStorageBackend::Dense || paged_admitted,
+                "storage {storage:?}, prompt {prompt_len}, generated {generated_len}"
+            );
+        }
+        let seq = sched.active_batch.get_mut(id).expect("row");
+        seq.prompt_tokens = prompt.clone();
+        seq.generated_tokens = generated;
+        seq.max_tokens = 24;
+        drain(&mut sched, &mut done);
+        assert_eq!(tokens_of(&done, &prompt), cycle_from(4, 24));
+    }
 }

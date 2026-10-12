@@ -182,7 +182,9 @@ pub enum SpeculativeDispatch {
     /// tick; everything else decodes in the regular batched step.
     PromptLookup {
         /// The drafter's tunables: `--draft-block-size` sets `max_draft`,
-        /// every other field is [`PromptLookupConfig::default`].
+        /// CUDA gated dispatch additionally sets the server emission floor,
+        /// shadow-confirmation length, and proposal-free pipeline cadence.
+        /// Other settings retain [`PromptLookupConfig::default`].
         config: PromptLookupConfig,
         /// `--prompt-lookup-max-batch`: verify rounds run only on ticks whose
         /// active decode batch has at most this many rows.
@@ -201,6 +203,23 @@ pub enum SpeculativeDispatch {
 /// workload, while a gate of 8 gains 15 to 63 % on raw-completion workloads
 /// but loses 13 % on the chat-template copy workload at concurrency 4.
 pub const DEFAULT_PROMPT_LOOKUP_MAX_BATCH: usize = 2;
+
+/// Minimum recent tokens emitted per verify round on the CUDA server.
+/// GB10 Qwen3-1.7B width 3 costs 1.76 pipelined steps and width 8 costs
+/// 3.91 (the cost table in `DraftPolicy`). Four emitted tokens cover the
+/// steady wide forward; narrow rounds emitting only two or three cannot
+/// amortize the switch tick and synchronous re-prime gap. Full copy blocks
+/// emit eight and amortize those transition costs across consecutive rounds.
+/// Once the emitted-token EMA is below the floor, a partial low-emission round
+/// pauses immediately. A complete miss gets one more probe only when the
+/// accepted-token EMA was already at least four, so an abrupt field boundary
+/// does not discard an established profitable copy run. Consecutive misses
+/// still pause. A round meeting the floor repays startup EMA debt.
+/// See `docs/benchmark_results/server-prompt-lookup-break-even-gb10-2026-10-11.md`.
+pub(crate) const PROMPT_LOOKUP_MIN_TOKENS_PER_ROUND: usize = 4;
+/// Require a whole default proposal's worth of shadow evidence to avoid
+/// resuming on the incidental two-token matches common in chat prose.
+pub(crate) const PROMPT_LOOKUP_SHADOW_CONFIRM_TOKENS: usize = 7;
 
 /// Draft-policy name for [`SpeculativeDispatch::summary`].
 fn draft_policy_name(policy: DraftPolicy) -> &'static str {
@@ -374,9 +393,17 @@ impl SpeculativeDispatch {
             });
         }
         let mut lookup = PromptLookupConfig::default();
+        if lookup.policy == DraftPolicy::Gated {
+            lookup.min_tokens_per_round = Some(PROMPT_LOOKUP_MIN_TOKENS_PER_ROUND);
+            lookup.shadow_confirm_tokens = PROMPT_LOOKUP_SHADOW_CONFIRM_TOKENS;
+            lookup.plain_rounds_before_pipeline = 0;
+        }
         if let Some(width) = config.draft_block_size {
             lookup.max_draft = width as usize;
         }
+        lookup.min_tokens_per_round = lookup
+            .min_tokens_per_round
+            .map(|floor| floor.min(lookup.max_draft.saturating_add(1)));
         lookup
             .validate()
             .map_err(|message| SpeculativeDispatchError::InvalidKind {
@@ -431,9 +458,12 @@ impl SpeculativeDispatch {
                 block_size_source.reason()
             ),
             Self::PromptLookup { config, max_batch } => format!(
-                "speculative=prompt-lookup (max_draft={}, policy={}, max_batch={max_batch})",
+                "speculative=prompt-lookup (max_draft={}, policy={}, max_batch={max_batch}, min_tokens_per_round={:?} (ema_with_profitable_boundary_miss_grace), shadow_confirm_tokens={}, plain_rounds_before_pipeline={})",
                 config.max_draft,
-                draft_policy_name(config.policy)
+                draft_policy_name(config.policy),
+                config.min_tokens_per_round,
+                config.shadow_confirm_tokens,
+                config.plain_rounds_before_pipeline
             ),
         }
     }

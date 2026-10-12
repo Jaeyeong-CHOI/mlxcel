@@ -126,6 +126,20 @@ pub struct PromptLookupConfig {
     /// How the adaptive governor sizes blocks and decides when to resume.
     /// Ignored when `adaptive` is `false`.
     pub policy: DraftPolicy,
+    /// Optional minimum EMA of emitted tokens (accepted proposals plus the
+    /// bonus) per drafted round. Gated adaptation pauses when the EMA is below
+    /// this floor and the current round also falls below it with at least one
+    /// proposed token left unaccepted. One complete miss is tolerated when the
+    /// accepted-token EMA was at least the floor before that miss. The floor
+    /// is capped at `max_draft + 1`; a fully accepted short block keeps
+    /// drafting because it is evidence that the available copy was exhausted,
+    /// not rejected.
+    /// `None` preserves the CLI policy.
+    pub min_tokens_per_round: Option<usize>,
+    /// Consecutive shadow tokens required to resume a paused gated row.
+    pub shadow_confirm_tokens: usize,
+    /// Proposal-free asks tolerated before enabling the plain-step pipeline.
+    pub plain_rounds_before_pipeline: usize,
 }
 
 impl Default for PromptLookupConfig {
@@ -136,6 +150,9 @@ impl Default for PromptLookupConfig {
             max_draft: DEFAULT_MAX_DRAFT,
             adaptive: true,
             policy: DraftPolicy::default_for_backend(),
+            min_tokens_per_round: None,
+            shadow_confirm_tokens: SHADOW_CONFIRM,
+            plain_rounds_before_pipeline: 2,
         }
     }
 }
@@ -173,9 +190,9 @@ pub enum DraftPolicy {
     /// Narrow (`GATED_NARROW_DRAFT`, 2 proposals) until a narrow block lands
     /// whole, then full (`max_draft`). While paused it keeps looking up and
     /// checks each proposal against the tokens decoding emits next; proposing
-    /// resumes only once `SHADOW_CONFIRM` (2) proposed tokens in a row came
-    /// true, and until a round lands a whole narrow block, a round that lands
-    /// nothing pauses again at once.
+    /// resumes once `shadow_confirm_tokens` proposed tokens in a row came
+    /// true (default 2, CUDA server 7). Until a round lands a whole narrow
+    /// block, a round that lands nothing pauses again at once.
     Gated,
 }
 
@@ -217,6 +234,14 @@ impl PromptLookupConfig {
                 "prompt-lookup max-draft ({}) must be at most {MAX_DRAFT_LIMIT}",
                 self.max_draft
             ));
+        }
+        if self.shadow_confirm_tokens == 0 || self.shadow_confirm_tokens > MAX_DRAFT_LIMIT {
+            return Err(format!(
+                "prompt-lookup shadow-confirm-tokens must be in 1..={MAX_DRAFT_LIMIT}"
+            ));
+        }
+        if self.min_tokens_per_round == Some(0) {
+            return Err("prompt-lookup min-tokens-per-round must be positive".to_string());
         }
         Ok(())
     }
@@ -290,6 +315,10 @@ const GATED_FULL_AT: f64 = 1.5;
 /// Accepted-proposal average a [`DraftPolicy::Gated`] governor starts from and
 /// resumes with: below [`GATED_FULL_AT`], so the first block is narrow.
 const GATED_START_EMA: f64 = 1.0;
+/// Low-yield rounds required to pause after an abrupt miss following profitable
+/// accepted-token history. The grace is limited to the first low-yield round;
+/// sustained partial yield and consecutive misses pause without another probe.
+const BREAK_EVEN_BOUNDARY_MISS_ROUNDS: usize = 2;
 /// Proposed tokens in a row a paused [`DraftPolicy::Gated`] governor must see
 /// come true before it proposes again. One is not enough on prose: the token
 /// after a two-token match is often a common one that happens to recur.
@@ -314,6 +343,10 @@ pub(crate) struct DraftGovernor {
     adaptive: bool,
     policy: DraftPolicy,
     accepted_ema: f64,
+    min_tokens_per_round: Option<usize>,
+    emitted_ema: f64,
+    drafted_samples: usize,
+    low_yield_rounds: usize,
     misses: usize,
     /// [`DraftPolicy::Graded`]: paused rounds left, and the next pause length.
     cooldown: usize,
@@ -340,6 +373,12 @@ impl DraftGovernor {
             adaptive: config.adaptive,
             policy: config.policy,
             accepted_ema,
+            min_tokens_per_round: config
+                .min_tokens_per_round
+                .map(|floor| floor.min(config.max_draft.saturating_add(1))),
+            emitted_ema: 0.0,
+            drafted_samples: 0,
+            low_yield_rounds: 0,
             misses: 0,
             cooldown: 0,
             next_cooldown: MIN_COOLDOWN,
@@ -375,11 +414,19 @@ impl DraftGovernor {
         }
     }
 
-    /// Record a drafted round that landed `accepted` proposals.
+    /// Record a configured-width drafted round in governor unit tests.
+    #[cfg(test)]
     pub(crate) fn record(&mut self, accepted: usize) {
+        self.record_round(accepted, self.max_draft);
+    }
+
+    /// Record a drafted round that landed `accepted` of `proposed` tokens.
+    pub(crate) fn record_round(&mut self, accepted: usize, proposed: usize) {
+        debug_assert!(accepted <= proposed);
         if !self.adaptive {
             return;
         }
+        let accepted_ema_before = self.accepted_ema;
         self.accepted_ema = 0.5 * self.accepted_ema + 0.5 * accepted as f64;
         match self.policy {
             DraftPolicy::Graded => {
@@ -396,6 +443,47 @@ impl DraftGovernor {
                 }
             }
             DraftPolicy::Gated => {
+                if let Some(floor) = self.min_tokens_per_round {
+                    // Only real verify rounds contribute; proposal-free asks
+                    // and retracted lookahead proposals carry no evidence.
+                    let emitted = accepted as f64 + 1.0;
+                    self.emitted_ema = if self.drafted_samples == 0 {
+                        emitted
+                    } else {
+                        0.5 * self.emitted_ema + 0.5 * emitted
+                    };
+                    self.drafted_samples = self.drafted_samples.saturating_add(1);
+                    let low_yield_rounds_before = self.low_yield_rounds;
+                    let incomplete_low = emitted < floor as f64 && accepted < proposed;
+                    if incomplete_low {
+                        self.low_yield_rounds = self.low_yield_rounds.saturating_add(1);
+                    } else {
+                        self.low_yield_rounds = 0;
+                    }
+                    // A zero-acceptance round after accepted drafts alone were
+                    // paying for the verify width is an abrupt copy-boundary
+                    // miss. Probe once more for the next repeated span. A
+                    // partial low-yield round is evidence of sustained weak
+                    // matches, and a second complete miss must not earn another
+                    // grace even when a large max_draft keeps the EMA high.
+                    let profitable_boundary_miss = incomplete_low
+                        && low_yield_rounds_before == 0
+                        && accepted == 0
+                        && accepted_ema_before >= floor as f64;
+                    let low_rounds_to_pause = if profitable_boundary_miss {
+                        BREAK_EVEN_BOUNDARY_MISS_ROUNDS
+                    } else {
+                        1
+                    };
+                    if self.drafted_samples >= 2
+                        && self.emitted_ema < floor as f64
+                        && self.low_yield_rounds >= low_rounds_to_pause
+                    {
+                        self.drafting = false;
+                        self.misses = 0;
+                        return;
+                    }
+                }
                 // Probation ends on a round that lands a whole narrow block:
                 // one stray token is what prose lands too, and on GB10 a run
                 // of such rounds (8B email: 6 drafted, 3 tokens landed) cost
@@ -424,14 +512,17 @@ impl DraftGovernor {
     }
 
     /// A paused [`DraftPolicy::Gated`] governor saw a lookup proposal come
-    /// true for [`SHADOW_CONFIRM`] tokens: resume with a narrow block, on
-    /// probation.
+    /// true for the configured `shadow_confirm_tokens`: resume with a narrow
+    /// block, on probation.
     pub(crate) fn shadow_confirmed(&mut self) {
         if self.probes_while_paused() {
             self.drafting = true;
             self.probation = true;
             self.misses = 0;
             self.accepted_ema = GATED_START_EMA;
+            self.emitted_ema = 0.0;
+            self.drafted_samples = 0;
+            self.low_yield_rounds = 0;
         }
     }
 }
@@ -447,11 +538,14 @@ pub(crate) struct ShadowProbe {
 }
 
 impl ShadowProbe {
-    /// `Some(true)` once the first [`SHADOW_CONFIRM`] proposed tokens all came
+    /// `Some(true)` once the first `confirm_tokens` proposed tokens all came
     /// true, `Some(false)` at the first one that did not, and `None` while
     /// decoding has not emitted that far yet.
-    pub(crate) fn settle(&self, context: &[i32]) -> Option<bool> {
-        for (i, &claimed) in self.proposal.iter().take(SHADOW_CONFIRM).enumerate() {
+    pub(crate) fn settle(&self, context: &[i32], confirm_tokens: usize) -> Option<bool> {
+        if self.proposal.len() < confirm_tokens {
+            return Some(false);
+        }
+        for (i, &claimed) in self.proposal.iter().take(confirm_tokens).enumerate() {
             match context.get(self.start + i) {
                 None => return None,
                 Some(&emitted) if emitted != claimed => return Some(false),
