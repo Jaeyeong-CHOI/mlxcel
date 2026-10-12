@@ -289,8 +289,9 @@ fn make_slice_sequence_with_id(
         created_at: Instant::now(),
         prefill_start: Some(Instant::now()),
         first_token_time: None,
+        prompt_lookup: None,
         token_history: Vec::new(),
-        sampler_state: None,
+        sampler: Default::default(),
         merged_eos: Vec::new(),
         thinking: ThinkingState::disabled(),
         structured: None,
@@ -355,7 +356,7 @@ fn run_to_completion_reference(
     );
     let summary = generator.last_acceptance().expect("summary");
     let tokenizer = crate::tokenizer::MlxcelTokenizer::stub();
-    let mut stream = begin_burst_stream(eos, &seq);
+    let mut stream = begin_burst_stream(eos, &seq, Default::default());
     stream_burst_tokens(&tokenizer, &mut seq, &mut stream, &tokens, &logprobs);
     let outcome = finalize_burst_stream(&tokenizer, seq, &stream, None);
     let events = drain_events(&rx);
@@ -394,6 +395,7 @@ fn run_slices(
         /* profile_probe_rounds */ 0,
         /* prefill_start_offset */ 0,
         &token_history,
+        Default::default(),
     );
     let mut committed_after_each_slice = vec![job.seq.generated_tokens.clone()];
 
@@ -540,6 +542,7 @@ fn slice_driver_probe_rounds_run_in_first_slices() {
         /* profile_probe_rounds */ 2,
         0,
         &[],
+        Default::default(),
     );
     let stepping_target = MockMtpTarget::new(target_script, vec![]);
     let mut committed = vec![job.seq.generated_tokens.clone()];
@@ -804,6 +807,7 @@ fn run_rotation_harness(
             /* profile_probe_rounds */ 0,
             /* prefill_start_offset */ 0,
             &[],
+            Default::default(),
         );
         state.stepping_target = Some(
             MockMtpTarget::new(state.spec.target_script.clone(), state.spec.eos.clone())
@@ -1236,7 +1240,7 @@ fn rotation_skip_cap_prevents_high_lane_starvation() {
 fn done_result_with(speculative: Option<SpeculativeStats>) -> GenerationResult {
     let (mut seq, rx) = make_slice_sequence(16);
     let tokenizer = crate::tokenizer::MlxcelTokenizer::stub();
-    let mut stream = begin_burst_stream(Vec::new(), &seq);
+    let mut stream = begin_burst_stream(Vec::new(), &seq, Default::default());
     stream_burst_tokens(&tokenizer, &mut seq, &mut stream, &[10, 11, 12], &[]);
     let _ = finalize_burst_stream(&tokenizer, seq, &stream, speculative);
     rx.try_iter()

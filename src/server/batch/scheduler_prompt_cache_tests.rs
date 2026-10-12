@@ -32,6 +32,11 @@
 //! * `SequenceInfo::prefill_start_offset` / `already_cached_tokens` transport
 //!   the hit metadata to the prefill path without forcing the rest of the
 //!   sequence struct to mutate.
+//!
+//! The cache-hit versus cache-miss equality of issue #2170 (a hit from a plan
+//! split point decodes what the miss decoded) drives the real scheduler over
+//! the model-owned fixture and lives next to it, in
+//! `scheduler_prompt_cache_plan_tests.rs` under the `scheduler` module.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -579,8 +584,9 @@ fn sequence_info_fields_transport_cache_hit_metadata() {
         created_at: Instant::now(),
         prefill_start: None,
         first_token_time: None,
+        prompt_lookup: None,
         token_history: Vec::new(),
-        sampler_state: None,
+        sampler: Default::default(),
         merged_eos: Vec::new(),
         thinking: crate::server::thinking_budget::ThinkingState::disabled(),
         structured: None,

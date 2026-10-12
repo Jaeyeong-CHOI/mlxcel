@@ -543,16 +543,12 @@ impl LanguageModel for LoadedModel {
         delegate_language_model!(self, reset_runtime_state())
     }
 
-    fn trim_internal_caches(&self, excess: i32) {
-        delegate_language_model!(self, trim_internal_caches(excess))
-    }
-
-    fn trim_sequence_state(
+    fn trim_state(
         &self,
-        seq_id: mlxcel_core::cache::SequenceId,
+        seq: Option<mlxcel_core::cache::SequenceId>,
         excess: i32,
     ) -> Result<(), String> {
-        delegate_language_model!(self, trim_sequence_state(seq_id, excess))
+        delegate_language_model!(self, trim_state(seq, excess))
     }
 
     // #2159: the scheduler pipelines a model-owned family only through these
@@ -655,19 +651,6 @@ impl LanguageModel for LoadedModel {
         delegate_language_model!(self, forward_batched(input_ids, batch_caches, mask))
     }
 
-    fn forward_batched_with_context(
-        &self,
-        input_ids: &mlxcel_core::MlxArray,
-        batch_caches: &mut [&mut [mlxcel_core::layers::KVCache]],
-        mask: Option<&mlxcel_core::MlxArray>,
-        context: Option<&mlxcel_core::generate::DecodeBatchContext>,
-    ) -> UniquePtr<mlxcel_core::MlxArray> {
-        delegate_language_model!(
-            self,
-            forward_batched_with_context(input_ids, batch_caches, mask, context)
-        )
-    }
-
     fn forward_with_sequence_id(
         &self,
         input_ids: &mlxcel_core::MlxArray,
@@ -709,17 +692,16 @@ impl LanguageModel for LoadedModel {
         delegate_language_model!(self, sync_sequence_storage(seq_id, cache_pool))
     }
 
-    fn forward_batched_with_context_and_ids(
+    fn forward_batched_with_ids(
         &self,
         input_ids: &mlxcel_core::MlxArray,
         seq_ids: Option<&[mlxcel_core::cache::SequenceId]>,
         batch_caches: &mut [&mut [mlxcel_core::layers::KVCache]],
         mask: Option<&mlxcel_core::MlxArray>,
-        context: Option<&mlxcel_core::generate::DecodeBatchContext>,
     ) -> UniquePtr<mlxcel_core::MlxArray> {
         delegate_language_model!(
             self,
-            forward_batched_with_context_and_ids(input_ids, seq_ids, batch_caches, mask, context)
+            forward_batched_with_ids(input_ids, seq_ids, batch_caches, mask)
         )
     }
 

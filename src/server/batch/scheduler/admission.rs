@@ -203,49 +203,52 @@ impl BatchScheduler {
 
         let mut sampling = merge_config_stop_tokens(options.sampling.clone(), &self.config_eos);
 
-        // b10621 logit_bias (#1485): the resolved request-or-server biases
-        // merge into the sequence's token-bias map first, additively
-        // (upstream's logit-bias sampler applies entries additively), with
-        // string keys tokenized against this model's vocabulary exactly as
-        // upstream's `common_tokenize(vocab, text, false)` does. Applied
-        // BEFORE the lang-bias merge below, whose empty-map condition then
-        // treats a biased request as carrying its own policy.
+        // The request's effective token bias, composed once by the rule the
+        // CLI uses too (#2169, `compose_token_bias`; its module doc records
+        // the precedence).
+        //
+        // 1. Request bias. b10621 logit_bias (#1485): the resolved
+        //    request-or-server biases merge into the map the request
+        //    resolution placed on the sampling config, additively (upstream's
+        //    logit-bias sampler applies entries additively), with string keys
+        //    tokenized against this model's vocabulary exactly as upstream's
+        //    `common_tokenize(vocab, text, false)` does.
+        let mut request_bias = std::mem::take(&mut sampling.token_bias);
         if !options.logit_bias.is_empty() || !options.logit_bias_texts.is_empty() {
             for &(id, bias) in &options.logit_bias {
-                sampling.token_bias.accumulate(id, bias);
+                request_bias.accumulate(id, bias);
             }
             for (text, bias) in &options.logit_bias_texts {
                 if let Ok(ids) = self.tokenizer.encode_with_special(text, false, false) {
                     for id in ids {
-                        sampling.token_bias.accumulate(id as i32, *bias);
+                        request_bias.accumulate(id as i32, *bias);
                     }
                 }
             }
         }
 
-        // Axis B (B8): attach the scheduler-wide token bias to each sequence's
-        // sampling config when no per-request override is present. Empty
-        // cached bias = bit-exact baseline (the `is_empty()` short-circuit in
-        // `sample_token_optimized` keeps hot-path cost at zero).
+        // 2. Language bias. Axis B (B8): the scheduler-wide token bias applies
+        //    when the request carries no bias of its own and no per-request
+        //    runtime override is present. Phase 1 limitation: one policy per
+        //    batch; per-request overrides via the `/v1/chat/completions`
+        //    request body are deferred to B12.
+        // 3. Output suppression. issue #350: the model's reserved multimodal
+        //    placeholder tokens (audio / image / video span markers) are
+        //    forced to -inf last and unconditionally, so suppression always
+        //    wins over any bias and a placeholder id can never become the
+        //    sampled argmax.
         //
-        // Phase 1 limitation: one policy per batch. Per-request overrides
-        // via `/v1/chat/completions` request body are deferred to B12.
-        if use_worker_token_bias && !self.token_bias.is_empty() && sampling.token_bias.is_empty() {
-            sampling.token_bias = self.token_bias.clone();
-        }
-
-        // issue #350: force-suppress the model's reserved multimodal
-        // placeholder tokens (audio / image / video span markers) on every
-        // sequence's output logits. Applied after the lang-bias merge and
-        // unconditionally, so suppression always wins over any per-request
-        // bias and a placeholder id can never become the sampled argmax. A
-        // no-op (and zero alloc) for non-multimodal models whose suppressed
-        // set is empty.
-        if !self.model_output_suppressed.is_empty() {
-            sampling
-                .token_bias
-                .suppress_tokens(&self.model_output_suppressed);
-        }
+        // Every source empty = an empty map, the bit-exact baseline (the
+        // `is_empty()` short-circuit in the sampler keeps hot-path cost at
+        // zero).
+        let no_language_bias = TokenBiasMap::new();
+        let language_bias = if use_worker_token_bias {
+            &self.token_bias
+        } else {
+            &no_language_bias
+        };
+        sampling.token_bias =
+            compose_token_bias(request_bias, language_bias, &self.model_output_suppressed);
 
         // XTC (Exclude Top Choices) special-token allowlist: the tokenizer's
         // newline id(s) plus every id in this request's merged end-of-sequence
@@ -256,7 +259,10 @@ impl BatchScheduler {
         // `xtc_probability == 0.0` and skip this entirely.
         if sampling.xtc_probability > 0.0 {
             let mut allowlist = self.xtc_newline_token_ids.clone();
-            for id in merged_eos_token_ids(self.model.eos_token_ids(), &sampling.stop_token_ids) {
+            for id in merged_eos_token_ids(
+                self.engine.model().eos_token_ids(),
+                &sampling.stop_token_ids,
+            ) {
                 if !allowlist.contains(&id) {
                     allowlist.push(id);
                 }
@@ -269,11 +275,15 @@ impl BatchScheduler {
         // model keeps generating until the token budget or a string stop.
         // Suppressing through the shared token-bias map reproduces that
         // exactly; the EOS stop check then never fires because the id can
-        // never be sampled. Opt-in only, so the common path stays bit-exact
-        // (and fused-batch eligible: a non-empty bias map already routes to
-        // the per-row sampler).
+        // never be sampled. Opt-in only, so the common path stays bit-exact.
+        // It stays outside `compose_token_bias` because the EOS set depends on
+        // the request's merged stop tokens; suppression is idempotent, so
+        // applying it after composition still wins over any bias.
         if options.ignore_eos {
-            let eos = merged_eos_token_ids(self.model.eos_token_ids(), &sampling.stop_token_ids);
+            let eos = merged_eos_token_ids(
+                self.engine.model().eos_token_ids(),
+                &sampling.stop_token_ids,
+            );
             sampling.token_bias.suppress_tokens(&eos);
         }
 
@@ -301,7 +311,7 @@ impl BatchScheduler {
             self.enable_vlm_prefix_cache,
             is_multimodal,
             !videos.is_empty(),
-            matches!(self.model, LoadedModel::Phi4MMVLM(_)),
+            matches!(self.engine.model(), LoadedModel::Phi4MMVLM(_)),
         );
 
         // For VLM sharing the image/audio placeholder tokens must be expanded
@@ -314,7 +324,7 @@ impl BatchScheduler {
         // the inner value is the optional merged embeddings.
         let prepared_early = if vlm_sharing_ok {
             match prepare_request_vlm_embeddings(
-                &self.model,
+                self.engine.model(),
                 &self.tokenizer,
                 &prompt,
                 &mut prompt_tokens,
@@ -399,7 +409,7 @@ impl BatchScheduler {
                 }
             }
             None => match prepare_request_vlm_embeddings(
-                &self.model,
+                self.engine.model(),
                 &self.tokenizer,
                 &prompt,
                 &mut prompt_tokens,
@@ -433,7 +443,9 @@ impl BatchScheduler {
         // pick up the previous VL row's delta and produce wrong
         // attention positions. Bind unconditionally for Qwen VL models;
         // the call is a no-op for everything else.
-        self.model.bind_qwen_vl_mrope_state_to_sequence(seq_id);
+        self.engine
+            .model()
+            .bind_qwen_vl_mrope_state_to_sequence(seq_id);
 
         // per-sequence `per_layer_inputs` for Gemma 4
         // E2B/E4B. `prepare_request_vlm_embeddings` writes the
@@ -442,14 +454,18 @@ impl BatchScheduler {
         // burst of Gemma 4 VLM requests in a single drain tick cannot
         // have one row consume another row's tensor. No-op for
         // everything that is not a Gemma 4 VLM.
-        self.model.bind_gemma4_per_layer_inputs_to_sequence(seq_id);
+        self.engine
+            .model()
+            .bind_gemma4_per_layer_inputs_to_sequence(seq_id);
 
         // Same lifecycle invariant for Falcon-OCR: the prefill state
         // (temporal positions, spatial coordinates, rope delta) is
         // written to a fallback slot during embedding preparation and
         // must be bound to this sequence before another request in the
         // same drain tick overwrites it. No-op for everything else.
-        self.model.bind_falcon_ocr_state_to_sequence(seq_id);
+        self.engine
+            .model()
+            .bind_falcon_ocr_state_to_sequence(seq_id);
 
         // Issue #85: same lifecycle invariant for Gemma 3n VLM. The
         // legacy `Gemma3nVLModel.cached_per_layer_inputs` cell was a
@@ -459,7 +475,9 @@ impl BatchScheduler {
         // panic on `Option::unwrap` when the timing flipped). The
         // call below is a no-op for everything that is not a
         // Gemma 3n VLM.
-        self.model.bind_gemma3n_per_layer_inputs_to_sequence(seq_id);
+        self.engine
+            .model()
+            .bind_gemma3n_per_layer_inputs_to_sequence(seq_id);
 
         let decode_state = StreamingDecodeState::new(&self.tokenizer, &prompt_tokens);
 
@@ -518,6 +536,7 @@ impl BatchScheduler {
 
         let retention = self.resolve_sequence_retention(&options, &prompt_tokens);
 
+        let sampler = RowSampler::new(&sampling);
         let seq = SequenceInfo {
             retention,
             seq_id,
@@ -551,8 +570,9 @@ impl BatchScheduler {
             created_at: Instant::now(),
             prefill_start: None,
             first_token_time: None,
+            prompt_lookup: None,
             token_history: Vec::new(),
-            sampler_state: None,
+            sampler,
             merged_eos: Vec::new(),
             thinking,
             // forward the structured-output constraint built by
@@ -687,10 +707,10 @@ impl BatchScheduler {
     /// `block_size` prompt tokens, per layer. Returns 0 when there is no paged
     /// pool (the budget gate is then a no-op for this model).
     pub(super) fn estimate_prefill_blocks(&self, prompt_len: usize) -> usize {
-        match self.cache_pool.paged_block_size() {
+        match self.engine.pool().paged_block_size() {
             Some(block_size) if block_size > 0 => prompt_len
                 .div_ceil(block_size)
-                .saturating_mul(self.model.num_layers()),
+                .saturating_mul(self.engine.model().num_layers()),
             _ => 0,
         }
     }
@@ -712,13 +732,14 @@ impl BatchScheduler {
             return 0;
         }
         let Some(suffix) = self
-            .cache_pool
+            .engine
+            .pool()
             .paged_blocks_to_reach(seq.seq_id, seq.prompt_tokens.len())
         else {
             return estimate;
         };
         if seq.already_cached_tokens > 0 {
-            suffix.max(self.model.num_layers())
+            suffix.max(self.engine.model().num_layers())
         } else {
             suffix
         }
@@ -730,7 +751,7 @@ impl BatchScheduler {
     /// watermark (issue #2088) is already taken off, so the single-sequence
     /// gate and the batched-prefill window charge against the same figure.
     pub(super) fn paged_prefill_room(&self) -> Option<usize> {
-        let total = self.cache_pool.paged_block_budget()?;
+        let total = self.engine.pool().paged_block_budget()?;
         let free = self.available_paged_blocks().unwrap_or(total);
         Some(free.saturating_sub(self.paged_admission_headroom()))
     }
@@ -741,7 +762,7 @@ impl BatchScheduler {
     /// budget). A no-op (`Some(seq)`) when no budget is configured.
     pub(super) fn admit_paged_prefill(&mut self, seq: SequenceInfo) -> Option<SequenceInfo> {
         // Opt-in: no budget configured ⇒ admit (default unbounded behaviour).
-        let total = match self.cache_pool.paged_block_budget() {
+        let total = match self.engine.pool().paged_block_budget() {
             Some(t) => t,
             None => return Some(seq),
         };

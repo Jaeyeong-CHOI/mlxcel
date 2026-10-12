@@ -3,6 +3,7 @@
 #include "mlx/backend/rocm/device.h"
 #include <algorithm>
 #include <atomic>
+#include "mlx/backend/rocm/gemms/hipblaslt_gemm.h"
 #include "mlx/backend/rocm/utils.h"
 #include "mlx/backend/rocm/worker.h"
 #include "mlx/utils.h"
@@ -17,9 +18,11 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <shared_mutex>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace mlx::core::rocm {
@@ -50,6 +53,11 @@ bool use_hip_graphs() {
   // Train graphs: also hard-off until a TrainArena (see RocmAllocator
   // train_arena_*) wraps the step tape with stable addresses. Flipping this
   // without an arena reintroduces aperture violations / wrong loss.
+  //
+  // The GEMM pointer wrappers (hipblaslt_gemm_ptrs, rocblas_gemm_ptrs) pass
+  // the host alpha/beta captured by value in the launch_kernel functor, which
+  // is only valid because the functor runs synchronously. If this is ever
+  // re-enabled with manual graph nodes that defer the functor, revisit them.
   return false;
 }
 
@@ -106,21 +114,89 @@ size_t max_inflight_bytes() {
   return bytes;
 }
 
-// Per-arch op/MB caps for the build graph. Tunable via env.
-// The earlier "corrupts at >3 nodes" was actually one bad op (Concatenate,
+// Op/MB caps for the build graph (fixed; the former MLX_MAX_MB_PER_BUFFER and
+// graph-side MLX_MAX_OPS_PER_BUFFER overrides were dead because the graph build
+// path is permanently off, see use_hip_graphs()). The earlier "corrupts at >3 nodes" was actually one bad op (Concatenate,
 // whose multi-copy kernels corrupt when co-grouped); it is now graph-split in
 // gpu::eval (is_graph_split_op), so large graphs are correct again.
 static std::pair<int, int> get_graph_limits() {
-  int ops = env::max_ops_per_buffer(50);
-  int mb = env::max_mb_per_buffer(200);
-  return {ops, mb};
+  return {50, 200};
 }
+
+namespace {
+
+// gcnArchName without any ":sramecc+:xnack-" style suffix.
+std::string base_arch_name(const char* gcn_arch_name) {
+  std::string base_arch = gcn_arch_name;
+  size_t colon_pos = base_arch.find(':');
+  if (colon_pos != std::string::npos) {
+    base_arch = base_arch.substr(0, colon_pos);
+  }
+  return base_arch;
+}
+
+// Architectures with a rocBLAS Tensile library (TensileLibrary_lazy_*.dat).
+const std::vector<std::string>& rocblas_archs() {
+  static const std::vector<std::string> archs = {
+      "gfx908",
+      "gfx90a",
+      "gfx942",
+      "gfx950",
+      "gfx1030",
+      "gfx1100",
+      "gfx1101",
+      "gfx1102",
+      "gfx1150",
+      "gfx1151",
+      "gfx1152",
+      "gfx1200",
+      "gfx1201"};
+  return archs;
+}
+
+// rocWMMA arch allowlist. Keep in sync with detect_rocm_hw_info() in
+// mlx/backend/rocm/quantized/qmm.hip. RDNA3.5: gfx1150/1151/1152 all have
+// WMMA; Device used to omit 1150/1152 which forced flash/qmm off on those
+// parts (incl. reduced-CU gfx1152 instances).
+const std::vector<std::string>& rocwmma_archs() {
+  static const std::vector<std::string> archs = {
+      "gfx908",
+      "gfx90a",
+      "gfx942",
+      "gfx1100",
+      "gfx1101",
+      "gfx1102",
+      "gfx1103",
+      "gfx1150",
+      "gfx1151",
+      "gfx1152",
+      "gfx1153",
+      "gfx1200",
+      "gfx1201",
+  };
+  return archs;
+}
+
+bool arch_in(const std::vector<std::string>& archs, const std::string& arch) {
+  return std::find(archs.begin(), archs.end(), arch) != archs.end();
+}
+
+} // namespace
 
 Device::Device(int device) : device_(device) {
   make_current();
   {
     hipDeviceProp_t p;
     if (hipGetDeviceProperties(&p, device_) == hipSuccess) {
+      arch_name_ = p.gcnArchName;
+      const std::string base_arch = base_arch_name(p.gcnArchName);
+      rocblas_arch_supported_ = arch_in(rocblas_archs(), base_arch);
+      has_native_wmma_ = arch_in(rocwmma_archs(), base_arch);
+      // CDNA2 (gfx90a) + CDNA3 (gfx942) only: clean v_mfma_f32_16x16x16bf16
+      // and a working hipBLASLt pointer-offset GEMM. gfx1151 (RDNA3.5) pegs on
+      // the offset path; gfx908 (CDNA1) bf16 MFMA differs; RDNA/others use
+      // WMMA.
+      cdna_mfma_ok_ = (base_arch == "gfx90a" || base_arch == "gfx942");
       fprintf(
           stderr,
           "[mlx-rocm] bound HIP device %d: %s (%s) cus=%d warp=%d lds=%dKB\n",
@@ -161,9 +237,20 @@ Device::Device(int device) : device_(device) {
               fw);
         }
       }
+    } else {
+      arch_name_ = "unknown";
     }
   }
-  // rocBLAS initialization is now lazy - done in get_rocblas_handle()
+  if (!rocblas_arch_supported_) {
+    std::cerr << "Warning: rocBLAS does not support GPU architecture '"
+              << arch_name_ << "'. "
+              << "Matrix multiplication operations will not be available. "
+              << "Supported architectures: gfx908, gfx90a, gfx942, gfx950, "
+              << "gfx1030, gfx1100, gfx1101, gfx1102, gfx1150, gfx1151, "
+              << "gfx1152, gfx1200, gfx1201." << std::endl;
+  }
+  // The rocBLAS handle itself is created on the first acquire_rocblas() or
+  // is_rocblas_available() call, under rocblas_mtx_.
 }
 
 Device::~Device() {
@@ -173,248 +260,68 @@ Device::~Device() {
 }
 
 rocblas_handle Device::get_rocblas_handle() {
-  if (!rocblas_initialized_) {
-    rocblas_initialized_ = true;
-    make_current();
-
-    // Check if the GPU architecture is supported by rocBLAS
-    hipDeviceProp_t props;
-    hipGetDeviceProperties(&props, device_);
-    std::string arch_name = props.gcnArchName;
-
-    // List of architectures supported by rocBLAS (based on TensileLibrary
-    // files). These are the architectures that have TensileLibrary_lazy_*.dat.
-    static const std::vector<std::string> supported_archs = {
-        "gfx908",
-        "gfx90a",
-        "gfx942",
-        "gfx950",
-        "gfx1030",
-        "gfx1100",
-        "gfx1101",
-        "gfx1102",
-        "gfx1150",
-        "gfx1151",
-        "gfx1152",
-        "gfx1200",
-        "gfx1201"};
-
-    // Extract base architecture name (remove any suffix like :sramecc+:xnack-)
-    std::string base_arch = arch_name;
-    size_t colon_pos = base_arch.find(':');
-    if (colon_pos != std::string::npos) {
-      base_arch = base_arch.substr(0, colon_pos);
-    }
-
-    bool arch_supported = false;
-    for (const auto& supported : supported_archs) {
-      if (base_arch == supported) {
-        arch_supported = true;
-        break;
-      }
-    }
-
-    if (!arch_supported) {
-      rocblas_available_ = false;
-      rocblas_ = nullptr;
-      std::cerr << "Warning: rocBLAS does not support GPU architecture '"
-                << arch_name << "'. "
-                << "Matrix multiplication operations will not be available. "
-                << "Supported architectures: gfx908, gfx90a, gfx942, gfx950, "
-                << "gfx1030, gfx1100, gfx1101, gfx1102, gfx1150, gfx1151, "
-                << "gfx1152, gfx1200, gfx1201." << std::endl;
-    } else {
-      rocblas_status status = rocblas_create_handle(&rocblas_);
-      if (status != rocblas_status_success) {
-        rocblas_available_ = false;
-        rocblas_ = nullptr;
-        std::cerr
-            << "Warning: rocBLAS initialization failed (status "
-            << static_cast<int>(status)
-            << "). Matrix multiplication operations will not be available."
-            << std::endl;
-      }
-    }
+  // rocblas_mtx_ is held by the caller.
+  if (rocblas_ready_.load(std::memory_order_acquire)) {
+    return rocblas_;
   }
-  if (!rocblas_available_) {
+  if (!rocblas_arch_supported_) {
     throw std::runtime_error(
         "rocBLAS is not available on this GPU architecture. "
         "Matrix multiplication operations are not supported.");
   }
+  make_current();
+  rocblas_handle handle = nullptr;
+  rocblas_status status = rocblas_create_handle(&handle);
+  if (status != rocblas_status_success || handle == nullptr) {
+    if (!rocblas_warned_) {
+      rocblas_warned_ = true;
+      std::cerr << "Warning: rocBLAS initialization failed (status "
+                << static_cast<int>(status)
+                << "). Matrix multiplication operations will not be available."
+                << std::endl;
+    }
+    // Nothing is cached: the next caller retries the create.
+    throw std::runtime_error(
+        "rocblas_create_handle failed (status " +
+        std::to_string(static_cast<int>(status)) + ")");
+  }
+  rocblas_ = handle;
+  // A fresh handle is bound to the null stream; the first lease rebinds it.
+  rocblas_stream_ = nullptr;
+  rocblas_ready_.store(true, std::memory_order_release);
   return rocblas_;
 }
 
+RocblasLease Device::acquire_rocblas(hipStream_t stream) {
+  std::unique_lock<std::mutex> lock(rocblas_mtx_);
+  rocblas_handle handle = get_rocblas_handle();
+  if (rocblas_stream_ != stream) {
+    rocblas_status status = rocblas_set_stream(handle, stream);
+    if (status != rocblas_status_success) {
+      throw std::runtime_error(
+          "rocblas_set_stream failed (status " +
+          std::to_string(static_cast<int>(status)) + ")");
+    }
+    rocblas_stream_ = stream;
+  }
+  return RocblasLease(std::move(lock), handle);
+}
+
 bool Device::is_rocblas_available() {
-  if (!rocblas_initialized_) {
-    try {
-      get_rocblas_handle();
-    } catch (...) {
-    }
+  if (!rocblas_arch_supported_) {
+    return false;
   }
-  return rocblas_available_;
-}
-
-bool Device::is_rocblas_bf16_available() {
-  if (!rocblas_bf16_probed_) {
-    rocblas_bf16_probed_ = true;
-    rocblas_bf16_available_ = false;
-
-    if (!is_rocblas_available()) {
-      return false;
-    }
-
-    // Probe: run a tiny bf16 GEMM and check if the GPU survives.
-    // rocBLAS may claim support but crash if the Tensile .co files
-    // are corrupt or missing specific kernel variants.
-    make_current();
-    void* a_ptr = nullptr;
-    void* b_ptr = nullptr;
-    void* c_ptr = nullptr;
-    hipError_t err;
-
-    err = hipMalloc(&a_ptr, 4 * 4 * 2); // 4x4 bf16
-    if (err != hipSuccess)
-      return false;
-    err = hipMalloc(&b_ptr, 4 * 4 * 2);
-    if (err != hipSuccess) {
-      hipFree(a_ptr);
-      return false;
-    }
-    err = hipMalloc(&c_ptr, 4 * 4 * 2);
-    if (err != hipSuccess) {
-      hipFree(a_ptr);
-      hipFree(b_ptr);
-      return false;
-    }
-
-    (void)hipMemset(a_ptr, 0, 4 * 4 * 2);
-    (void)hipMemset(b_ptr, 0, 4 * 4 * 2);
-    (void)hipMemset(c_ptr, 0, 4 * 4 * 2);
-
-    float alpha = 1.0f, beta = 0.0f;
-    rocblas_status status = rocblas_gemm_ex(
-        rocblas_,
-        rocblas_operation_none,
-        rocblas_operation_none,
-        4,
-        4,
-        4,
-        &alpha,
-        a_ptr,
-        rocblas_datatype_bf16_r,
-        4,
-        b_ptr,
-        rocblas_datatype_bf16_r,
-        4,
-        &beta,
-        c_ptr,
-        rocblas_datatype_bf16_r,
-        4,
-        c_ptr,
-        rocblas_datatype_bf16_r,
-        4,
-        rocblas_datatype_f32_r,
-        rocblas_gemm_algo_standard,
-        0,
-        0);
-
-    // Sync and check if the GPU is still alive
-    hipError_t sync_err = hipDeviceSynchronize();
-    // Clear any lingering error
-    (void)hipGetLastError();
-
-    hipFree(a_ptr);
-    hipFree(b_ptr);
-    hipFree(c_ptr);
-
-    if (status == rocblas_status_success && sync_err == hipSuccess) {
-      rocblas_bf16_available_ = true;
-    } else {
-      // GPU may be in a bad state — need to reset
-      (void)hipDeviceReset();
-      // Re-initialize device
-      make_current();
-      // Re-create rocBLAS handle
-      if (rocblas_) {
-        rocblas_destroy_handle(rocblas_);
-        rocblas_ = nullptr;
-      }
-      rocblas_status rs = rocblas_create_handle(&rocblas_);
-      if (rs != rocblas_status_success) {
-        rocblas_available_ = false;
-      }
-      std::cerr << "Warning: rocBLAS bfloat16 GEMM probe failed on this GPU. "
-                << "Using fallback kernels for bf16 matmul." << std::endl;
-    }
+  // A ready device answers without the mutex, so a thread holding a
+  // RocblasLease can ask without deadlocking.
+  if (rocblas_ready_.load(std::memory_order_acquire)) {
+    return true;
   }
-  return rocblas_bf16_available_;
-}
-
-bool Device::has_native_wmma() {
-  if (!wmma_probed_) {
-    wmma_probed_ = true;
-
-    hipDeviceProp_t props;
-    if (hipGetDeviceProperties(&props, device_) != hipSuccess) {
-      has_native_wmma_ = false;
-      return has_native_wmma_;
-    }
-
-    // Strip any ":sramecc+:xnack-" style suffix from gcnArchName.
-    std::string base_arch = props.gcnArchName;
-    size_t colon_pos = base_arch.find(':');
-    if (colon_pos != std::string::npos) {
-      base_arch = base_arch.substr(0, colon_pos);
-    }
-
-    // rocWMMA arch allowlist. Keep in sync with detect_rocm_hw_info() in
-    // mlx/backend/rocm/quantized/qmm.hip. RDNA3.5: gfx1150/1151/1152 all have
-    // WMMA; Device used to omit 1150/1152 which forced flash/qmm off on those
-    // parts (incl. reduced-CU gfx1152 instances).
-    static const std::vector<std::string> rocwmma_archs = {
-        "gfx908",
-        "gfx90a",
-        "gfx942",
-        "gfx1100",
-        "gfx1101",
-        "gfx1102",
-        "gfx1103",
-        "gfx1150",
-        "gfx1151",
-        "gfx1152",
-        "gfx1153",
-        "gfx1200",
-        "gfx1201",
-    };
-    for (const auto& a : rocwmma_archs) {
-      if (base_arch == a) {
-        has_native_wmma_ = true;
-        break;
-      }
-    }
+  std::lock_guard<std::mutex> lock(rocblas_mtx_);
+  try {
+    get_rocblas_handle();
+  } catch (...) {
   }
-  return has_native_wmma_;
-}
-
-bool Device::supports_cdna_mfma_gemm() {
-  if (!cdna_mfma_probed_) {
-    cdna_mfma_probed_ = true;
-    hipDeviceProp_t props;
-    if (hipGetDeviceProperties(&props, device_) != hipSuccess) {
-      cdna_mfma_ok_ = false;
-      return cdna_mfma_ok_;
-    }
-    std::string base_arch = props.gcnArchName;
-    size_t colon_pos = base_arch.find(':');
-    if (colon_pos != std::string::npos) {
-      base_arch = base_arch.substr(0, colon_pos);
-    }
-    // CDNA2 (gfx90a) + CDNA3 (gfx942) only: clean v_mfma_f32_16x16x16bf16 and a
-    // working hipBLASLt pointer-offset GEMM. gfx1151 (RDNA3.5) pegs on the
-    // offset path; gfx908 (CDNA1) bf16 MFMA differs; RDNA/others use WMMA.
-    cdna_mfma_ok_ = (base_arch == "gfx90a" || base_arch == "gfx942");
-  }
-  return cdna_mfma_ok_;
+  return rocblas_ready_.load(std::memory_order_acquire);
 }
 
 void Device::make_current() {
@@ -425,13 +332,6 @@ void Device::make_current() {
   if (current != device_) {
     CHECK_HIP_ERROR(hipSetDevice(device_));
     current = device_;
-  }
-}
-
-void Device::set_rocblas_stream(hipStream_t stream) {
-  if (rocblas_stream_ != stream) {
-    rocblas_set_stream(get_rocblas_handle(), stream);
-    rocblas_stream_ = stream;
   }
 }
 
@@ -452,7 +352,16 @@ CommandEncoder& Device::get_command_encoder(Stream s) {
 }
 
 void Device::clear_encoders() {
-  encoders_.clear();
+  // Take the encoders out under the lock and destroy them after it is
+  // released: ~CommandEncoder waits on in-flight work and releases HIP
+  // resources, and must not run while encoders_mtx_ is held, which
+  // get_command_encoder and find_encoder take from other threads
+  // (lablup/mlxcel#2197).
+  std::unordered_map<int, std::unique_ptr<CommandEncoder>> encoders;
+  {
+    std::lock_guard<std::mutex> lk(encoders_mtx_);
+    encoders.swap(encoders_);
+  }
 }
 
 CommandEncoder* Device::find_encoder(Stream s) {
@@ -478,6 +387,10 @@ CommandEncoder::~CommandEncoder() {
   // Destructor path: a failed destroy has nowhere to go, and on a device that
   // has faulted every one of these returns the fault.
   release_inflight();
+  // The hipBLASLt workspace is keyed by stream handle; give it back before
+  // stream_ is destroyed so a later stream with the same handle value starts
+  // without a buffer a queued GEMM may still be reading (lablup/mlxcel#2200).
+  hipblaslt_release_stream_workspace(stream_);
   for (hipEvent_t ev : spare_events_) {
     (void)hipEventDestroy(ev);
   }
@@ -588,13 +501,49 @@ void CommandEncoder::check_launch(const char* primitive) {
   throw std::runtime_error(oss.str());
 }
 
-std::unordered_map<int, Device>& get_devices();
+namespace {
+
+// [mlxcel #2197] One Device per HIP device index, built on first use. The
+// table is read on every launch, from whichever thread evaluates (the server's
+// scheduler, embedding, rerank and audio workers each run on their own
+// stream), and written when a stream is first created on a device, so it is
+// locked like the JIT module cache (LOCAL_FIXES item 35): a shared lock for
+// the lookup, the unique lock only around a first construction. Upstream CUDA
+// at the pin (mlx/backend/cuda/device.cpp) instead constructs every device in
+// one magic-static initializer and reads the vector afterwards; the fork keeps
+// lazy construction because Device::Device binds the device (hipSetDevice),
+// and on a multi-GPU host a context on a GPU nobody asked for wedges the
+// discrete GPU's queue over a TB5 link (see ensure_device_flags). Leaked, as
+// upstream's devices are: user code may still evaluate after the main thread
+// has torn down, and no Device or CommandEncoder destructor then runs during
+// static teardown, where on a faulted device every HIP call fails (item 7).
+// Nothing is ever erased, so a Device& handed out stays valid for the process.
+struct DeviceTable {
+  std::shared_mutex mtx;
+  std::unordered_map<int, Device> devices;
+};
+
+DeviceTable& device_table() {
+  static auto* table = new DeviceTable;
+  return *table;
+}
+
+// The Device for `index` if one has been built, else nullptr. The shared lock
+// is held for the lookup only, so callers use the result without the table's
+// lock and the lock order (table, then Device::encoders_mtx_) cannot invert.
+Device* find_device(int index) {
+  auto& table = device_table();
+  std::shared_lock lock(table.mtx);
+  auto it = table.devices.find(index);
+  return it == table.devices.end() ? nullptr : &it->second;
+}
+
+} // namespace
 
 Error& record_stream_error(Stream s, hipError_t status, const char* where) {
   if (s.device.type == mlx::core::Device::gpu) {
-    auto& devices = get_devices();
-    if (auto it = devices.find(s.device.index); it != devices.end()) {
-      if (auto* encoder = it->second.find_encoder(s)) {
+    if (Device* d = find_device(s.device.index)) {
+      if (auto* encoder = d->find_encoder(s)) {
         encoder->set_device_error(status, where);
         return encoder->error();
       }
@@ -785,39 +734,6 @@ void CommandEncoder::add_kernel_node_kp(const hipKernelNodeParams& kp) {
     // records any launched kernel that the manual node API won't accept), so
     // the chunk stays ~1 fragment. Else fall back to the eager graph-split.
     (void)hipGetLastError();
-    static const bool cap_reject = [] {
-      const char* e = std::getenv("MLX_GRAPH_PREFILL_REPLAY");
-      return e && e[0] == '1';
-    }();
-    if (cap_reject && !graph_decode_mode()) {
-      device_.make_current();
-      hipError_t be =
-          hipStreamBeginCapture(stream_, hipStreamCaptureModeThreadLocal);
-      if (be == hipSuccess) {
-        (void)hipLaunchKernel(
-            kp.func,
-            kp.gridDim,
-            kp.blockDim,
-            kp.kernelParams,
-            kp.sharedMemBytes,
-            stream_);
-        hipGraph_t child = nullptr;
-        hipError_t ee = hipStreamEndCapture(stream_, &child);
-        if (ee == hipSuccess && child) {
-          size_t nn = 0;
-          hipGraphGetNodes(child, nullptr, &nn);
-          if (nn > 0) {
-            add_child_graph_node(child, key);
-            hipGraphDestroy(child);
-            return;
-          }
-          hipGraphDestroy(child);
-        } else if (child) {
-          hipGraphDestroy(child);
-        }
-        (void)hipGetLastError();
-      }
-    }
     commit();
     device_.make_current();
     (void)hipLaunchKernel(
@@ -996,9 +912,6 @@ bool CommandEncoder::decode_capture_begin() {
   if (e != hipSuccess) {
     g_decode_capturing.store(false, std::memory_order_relaxed);
     (void)hipGetLastError();
-    static const bool dbg = std::getenv("MLX_PURE_DEBUG") != nullptr;
-    if (dbg)
-      fprintf(stderr, "[cap] BeginCapture failed: %s\n", hipGetErrorString(e));
     return false;
   }
   return true;
@@ -1007,7 +920,6 @@ bool CommandEncoder::decode_capture_begin() {
 bool CommandEncoder::decode_capture_end_record(int slot) {
   device_.make_current();
   slot &= 1;
-  static const bool dbg = std::getenv("MLX_PURE_DEBUG") != nullptr;
   hipGraph_t g = nullptr;
   hipError_t ee = hipStreamEndCapture(stream_, &g);
   g_decode_capturing.store(false, std::memory_order_relaxed);
@@ -1015,52 +927,10 @@ bool CommandEncoder::decode_capture_end_record(int slot) {
     if (g)
       hipGraphDestroy(g);
     (void)hipGetLastError();
-    if (dbg)
-      fprintf(stderr, "[cap] EndCapture failed: %s\n", hipGetErrorString(ee));
     return false;
   }
   size_t nn = 0;
   hipGraphGetNodes(g, nullptr, &nn);
-  if (dbg) {
-    fprintf(stderr, "[cap] captured %zu nodes\n", nn);
-    std::vector<hipGraphNode_t> nodes(nn);
-    if (hipGraphGetNodes(g, nodes.data(), &nn) == hipSuccess) {
-      int n_kernel = 0, n_memcpy = 0, n_memset = 0, n_event = 0, n_other = 0;
-      for (auto& nd : nodes) {
-        hipGraphNodeType ty;
-        if (hipGraphNodeGetType(nd, &ty) != hipSuccess) {
-          n_other++;
-          continue;
-        }
-        switch (ty) {
-          case hipGraphNodeTypeKernel:
-            n_kernel++;
-            break;
-          case hipGraphNodeTypeMemcpy:
-            n_memcpy++;
-            break;
-          case hipGraphNodeTypeMemset:
-            n_memset++;
-            break;
-          case hipGraphNodeTypeEventRecord:
-          case hipGraphNodeTypeWaitEvent:
-            n_event++;
-            break;
-          default:
-            n_other++;
-            break;
-        }
-      }
-      fprintf(
-          stderr,
-          "[cap] node types: kernel=%d memcpy=%d memset=%d event=%d other=%d\n",
-          n_kernel,
-          n_memcpy,
-          n_memset,
-          n_event,
-          n_other);
-    }
-  }
   if (nn == 0) {
     hipGraphDestroy(g);
     return false;
@@ -1068,8 +938,6 @@ bool CommandEncoder::decode_capture_end_record(int slot) {
   hipGraphExec_t exec = nullptr;
   hipError_t ie = hipGraphInstantiate(&exec, g, nullptr, nullptr, 0);
   if (ie != hipSuccess) {
-    if (dbg)
-      fprintf(stderr, "[cap] Instantiate failed: %s\n", hipGetErrorString(ie));
     hipGraphDestroy(g);
     (void)hipGetLastError();
     return false;
@@ -1142,19 +1010,12 @@ void CommandEncoder::commit() {
     // ExecUpdate fails) reinstantiate into the slot. The slot owns the source
     // graph + arg Packs for the exec's life (CLR stores kernelParams by
     // pointer).
-    static const bool prefill_replay_cu = [] {
-      const char* e = std::getenv("MLX_GRAPH_PREFILL_REPLAY");
-      return e && e[0] == '1';
-    }();
-    const bool use_execupdate = graph_decode_mode() || prefill_replay_cu;
+    const bool use_execupdate = graph_decode_mode();
     auto& pool = exec_pool_[graph_nodes_key_ + ":" + graph_deps_key_];
     // For the stable decode topology, grow the pool to N execs (skip reuse
     // until then) so replay always finds a drained slot despite completion-flag
     // lag.
-    static const size_t replay_slots = [] {
-      const char* e = std::getenv("MLX_GRAPH_REPLAY_SLOTS");
-      return e ? std::max<size_t>(2, std::atoi(e)) : 4;
-    }();
+    constexpr size_t replay_slots = 4;
     const std::string& grow_key =
         graph_decode_mode() ? decode_key_ : prefill_key_;
     const bool force_grow = use_execupdate && !grow_key.empty() &&
@@ -1211,27 +1072,9 @@ void CommandEncoder::commit() {
     }
     inflight->store(1, std::memory_order_release);
 
-    // Reclaim this chunk's deferred-free buffers once it has drained, bounding
-    // graph-mode memory to a sliding window of chunks instead of a whole
-    // forward (which OOMs a 32GB card). Free with a generation LAG so a buffer
-    // is only released after the next few chunks have also launched — covers
-    // cross-chunk / in-place references that a lag-0 free races
-    // (use-after-free). Tunable via MLX_GRAPH_FREE_LAG. Opt-in
-    // (MLX_GRAPH_FREE_LAG): per-chunk reclaim is currently racy (frees a buffer
-    // the next chunk still references → UAF), so OFF by default — frees flush
-    // safely at the per-token synchronize. The real fix is 100% buffer reuse
-    // (deterministic per-forward addresses), not freeing.
-    static const long free_lag = [] {
-      const char* e = std::getenv("MLX_GRAPH_FREE_LAG");
-      return e ? std::atol(e) : -1;
-    }();
     uint64_t my_gen = graph_current_gen();
     graph_advance_gen();
     CHECK_HIP_ERROR(hipGraphLaunch(graph_exec, stream_));
-    if (free_lag >= 0 && static_cast<long>(my_gen) > free_lag) {
-      uint64_t fg = my_gen - free_lag;
-      add_completed_handler([fg]() { free_graph_generation(fg); });
-    }
     // Reclaim this chunk's stream-ordered POOL buffers now, via hipFreeAsync
     // queued right after the launch on stream_ (retires after the graph; no
     // blocking drain). This is the common case on the discrete pool and keeps
@@ -1239,12 +1082,9 @@ void CommandEncoder::commit() {
     free_graph_generation_async(my_gen);
     // Backstop ONLY for the non-stream-ordered remainder (unified/slab buffers,
     // rare on the discrete path): if that residual backlog still exceeds a cap,
-    // drain + flush. MLX_GRAPH_DEFER_MAX_MB (default 2048; 0 disables).
-    static const size_t defer_cap = [] {
-      const char* e = std::getenv("MLX_GRAPH_DEFER_MAX_MB");
-      return static_cast<size_t>(e ? std::atoll(e) : 2048) << 20;
-    }();
-    if (defer_cap && graph_deferred_bytes() > defer_cap) {
+    // drain + flush (fixed 2048 MB cap).
+    constexpr size_t defer_cap = static_cast<size_t>(2048) << 20;
+    if (graph_deferred_bytes() > defer_cap) {
       (void)hipStreamSynchronize(stream_);
       flush_graph_deferred_frees();
     }
@@ -1467,22 +1307,12 @@ void set_graph_active(bool v) {
 // Decode-mode: a single-token forward accrues into ONE graph (no mid-forward
 // commit) that is refreshed via hipGraphExecUpdate and launched once per token.
 // Set by the generation loop for Lstep==1 steps; prefill leaves it off so its
-// large intermediates stay bounded by the per-graph caps. Disable entirely with
-// MLX_GRAPH_DECODE=0.
+// large intermediates stay bounded by the per-graph caps.
 bool graph_decode_mode() {
-  static const bool enabled = [] {
-    const char* e = std::getenv("MLX_GRAPH_DECODE");
-    return !(e && std::string(e) == "0");
-  }();
-  return enabled && g_graph_decode_mode.load(std::memory_order_relaxed);
+  return g_graph_decode_mode.load(std::memory_order_relaxed);
 }
 void set_graph_decode_mode(bool v) {
   g_graph_decode_mode.store(v, std::memory_order_relaxed);
-}
-
-std::unordered_map<int, Device>& get_devices() {
-  static std::unordered_map<int, Device> devices;
-  return devices;
 }
 
 void ensure_device_flags(int device_index) {
@@ -1555,9 +1385,20 @@ void ensure_current_device_flags() {
 }
 
 Device& device(mlx::core::Device device) {
-  auto& devices = get_devices();
-  auto it = devices.find(device.index);
-  if (it == devices.end()) {
+  // Hit path: one shared lock, no HIP call. This runs for every primitive.
+  if (Device* d = find_device(device.index)) {
+    return *d;
+  }
+  // Miss: build the Device under the unique lock, after a re-check, so several
+  // threads first using one index build it once and a reader never walks the
+  // table while it is being inserted into. The only HIP work under the table's
+  // lock is this construction, and it touches only the requested index. If the
+  // constructor or HIP throws, nothing is inserted, the unwind releases the
+  // lock and the next call retries.
+  auto& table = device_table();
+  std::unique_lock lock(table.mtx);
+  auto it = table.devices.find(device.index);
+  if (it == table.devices.end()) {
     // Bind this device (callers rely on it being current afterwards) and make
     // sure it is in blocking-sync mode before the Device and its streams are
     // constructed. The first unified allocation usually got there first, since
@@ -1565,7 +1406,7 @@ Device& device(mlx::core::Device device) {
     // ensure_device_flags() for why the order matters.
     (void)hipSetDevice(device.index);
     ensure_device_flags(device.index);
-    it = devices.try_emplace(device.index, device.index).first;
+    it = table.devices.try_emplace(device.index, device.index).first;
   }
   return it->second;
 }
@@ -1584,9 +1425,21 @@ CommandEncoder& get_command_encoder(Stream s) {
 }
 
 void clear_all_encoders() {
-  auto& devices = get_devices();
-  for (auto& [idx, dev] : devices) {
-    dev.clear_encoders();
+  // Collect the devices under the shared lock, then clear each one with the
+  // table unlocked: ~CommandEncoder must never run while the table is locked,
+  // or anything it reaches that looks a device up would deadlock on the
+  // non-recursive lock. Devices are never erased, so the pointers stay valid.
+  std::vector<Device*> devices;
+  {
+    auto& table = device_table();
+    std::shared_lock lock(table.mtx);
+    devices.reserve(table.devices.size());
+    for (auto& [idx, dev] : table.devices) {
+      devices.push_back(&dev);
+    }
+  }
+  for (Device* dev : devices) {
+    dev->clear_encoders();
   }
 }
 
