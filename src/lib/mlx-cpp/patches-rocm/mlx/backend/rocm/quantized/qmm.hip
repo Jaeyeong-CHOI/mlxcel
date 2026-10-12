@@ -2,12 +2,14 @@
 
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/rocm/device.h"
+#include "mlx/backend/rocm/env_int.h"
 #include "mlx/backend/rocm/gemms/naive_gemm.h"
 #include "mlx/backend/rocm/gemms/hipblaslt_gemm.h"
 #include "mlx/backend/rocm/gemms/rocblas_gemm.h"
 #include "mlx/backend/rocm/kernel_utils.hpp"
 #include "mlx/backend/rocm/quantized/quantized.h"
 #include "mlx/backend/rocm/quantized/qmv_tiled_kernel.hip"
+#include "mlx/backend/rocm/rocm.h"
 #include "mlx/primitives.h"
 
 #include <hip/hip_bfloat16.h>
@@ -34,6 +36,8 @@
 #endif
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <list>
@@ -431,50 +435,6 @@ inline bool parse_warp_kernel_env(const char* env_name, bool default_value) {
   return default_value;
 }
 
-inline int parse_positive_int_env(const char* env_name, int default_value) {
-  const char* raw = std::getenv(env_name);
-  if (raw == nullptr || *raw == '\0') {
-    return default_value;
-  }
-
-  char* end = nullptr;
-  long value = std::strtol(raw, &end, 10);
-  if (end == raw || *end != '\0' || value <= 0) {
-    return default_value;
-  }
-  return static_cast<int>(value);
-}
-
-inline size_t parse_non_negative_size_t_env(
-    const char* env_name,
-    size_t default_value) {
-  const char* raw = std::getenv(env_name);
-  if (raw == nullptr || *raw == '\0') {
-    return default_value;
-  }
-
-  char* end = nullptr;
-  unsigned long long value = std::strtoull(raw, &end, 10);
-  if (end == raw || *end != '\0') {
-    return default_value;
-  }
-  return static_cast<size_t>(value);
-}
-
-inline int parse_non_negative_int_env(const char* env_name, int default_value) {
-  const char* raw = std::getenv(env_name);
-  if (raw == nullptr || *raw == '\0') {
-    return default_value;
-  }
-
-  char* end = nullptr;
-  long value = std::strtol(raw, &end, 10);
-  if (end == raw || *end != '\0' || value < 0) {
-    return default_value;
-  }
-  return static_cast<int>(value);
-}
-
 // Check if rocBLAS dequant fast path should be used
 // Default ON
 inline bool use_rocblas_dequant_path() {
@@ -788,8 +748,13 @@ inline bool should_use_dequant_gemm_path(
     bool transpose,
     bool can_use_batched_qmv,
     rocm::Device& d) {
-  int env_threshold =
-      parse_positive_int_env("MLX_ROCM_QMM_DEQUANT_M_THRESHOLD", -1);
+  static const int env_threshold = rocm::env_int_or_default(
+      "MLX_ROCM_QMM_DEQUANT_M_THRESHOLD",
+      -1,
+      1,
+      std::numeric_limits<int>::max(),
+      "a positive integer",
+      "the built-in crossover");
   if (env_threshold > 0) {
     return M >= env_threshold;
   }
@@ -830,6 +795,13 @@ enum class QmmRoute {
   WmmaDense, // qmm_wmma_dense_kernel, fused dequant + rocWMMA
   DequantFp8Gemm, // dequant_fp8_gemm (weight and activation in e4m3)
   DequantGemm, // dequantize (cached) + dequant_rocblas_gemm in the x dtype
+  // The same GEMM for a bf16 shape the fused kernel would take below the row
+  // ceiling (wmma_qmm_max_m). The weight is dequantized into a temporary on
+  // every call and never enters the dequantized-weight cache: a forward pass
+  // runs more distinct projections at these row counts than the cache holds,
+  // so it never hit, and its last entries stayed alive through decode
+  // (lablup/mlxcel#2151).
+  DequantGemmAboveWmmaCeiling,
   Other, // qmv, batched qmv and the tiled kernels below
 };
 
@@ -876,8 +848,13 @@ inline int wmma_qmm_env() {
 // tiers were not measured and keep the kernel at every row count unless
 // MLX_ROCM_WMMA_QMM_MAX_M sets a ceiling; MLX_ROCM_WMMA_QMM=1 removes it.
 inline int wmma_qmm_max_m(rocm::Device& d) {
-  static const int env_value =
-      parse_positive_int_env("MLX_ROCM_WMMA_QMM_MAX_M", -1);
+  static const int env_value = rocm::env_int_or_default(
+      "MLX_ROCM_WMMA_QMM_MAX_M",
+      -1,
+      1,
+      std::numeric_limits<int>::max(),
+      "a positive integer",
+      "the per-device default");
   if (env_value > 0) {
     return env_value;
   }
@@ -913,7 +890,16 @@ inline QmmRoute select_qmm_route(const QmmRouteInputs& in, rocm::Device& d) {
       single && in.M > 1 && (in.N % 16 == 0) && in.group_size == 64 &&
       (in.K % 64 == 0) &&
       (in.bits == 4 || in.bits == 6 || in.bits == 8) && d.has_native_wmma();
-  if (want_wmma && wmma_shape) {
+  // Up to 8 rows of a 4- or 8-bit shape with biases, qmv_wide_kernel reads the
+  // weight once for all rows. On gfx1151 the fused kernel cost 7 to 8 times
+  // the one-row GEMV there (Meta-Llama-3.1-8B shapes, bf16, 2 to 8 rows:
+  // about 4.2 ms against 0.56 ms summed over one layer's projections), so a
+  // decode batch, whose [B, 1, K] rows reach this point since the batch fold
+  // (lablup/mlxcel#2156), takes the same qmv / dequantize crossover as f16.
+  // MLX_ROCM_WMMA_QMM=1 still forces the fused kernel.
+  const bool wide_qmv_rows = in.M <= 8 && (in.bits == 4 || in.bits == 8) &&
+      in.biases_dtype.has_value();
+  if (want_wmma && wmma_shape && !(env != 1 && wide_qmv_rows)) {
     // The ceiling only hands the GEMM to the bf16 dequant + hipBLASLt path it
     // was measured against; where the fallback would be the fp8 path the
     // fused kernel stays.
@@ -922,7 +908,7 @@ inline QmmRoute select_qmm_route(const QmmRouteInputs& in, rocm::Device& d) {
     if (!hipblaslt_is_faster) {
       return QmmRoute::WmmaDense;
     }
-    return QmmRoute::DequantGemm;
+    return QmmRoute::DequantGemmAboveWmmaCeiling;
   }
   if (fp8()) {
     return QmmRoute::DequantFp8Gemm;
@@ -979,47 +965,111 @@ struct DequantCacheEntry {
 };
 
 inline int dequant_cache_capacity() {
-  static int capacity = []() {
-    const char* raw = std::getenv("MLX_ROCM_QMM_DEQUANT_CACHE_SIZE");
-    if (raw == nullptr || *raw == '\0') {
-      return 8;
-    }
-    char* end = nullptr;
-    long value = std::strtol(raw, &end, 10);
-    if (end == raw || *end != '\0' || value < 0) {
-      return 8;
-    }
-    return static_cast<int>(value);
-  }();
+  // 0 turns the cache off.
+  static const int capacity = rocm::env_int_or_default(
+      "MLX_ROCM_QMM_DEQUANT_CACHE_SIZE",
+      8,
+      0,
+      std::numeric_limits<int>::max(),
+      "a non-negative integer");
   return capacity;
 }
 
 inline size_t dequant_cache_max_bytes() {
-  static size_t max_bytes = parse_non_negative_size_t_env(
-      "MLX_ROCM_QMM_DEQUANT_CACHE_MAX_BYTES", 256ULL * 1024ULL * 1024ULL);
+  static const size_t max_bytes = static_cast<size_t>(rocm::env_u64_or_default(
+      "MLX_ROCM_QMM_DEQUANT_CACHE_MAX_BYTES", 256ULL * 1024ULL * 1024ULL));
   return max_bytes;
 }
 
-inline int qmm_gemm_solution_index_f32(bool batched) {
-  static int single_index =
-      parse_non_negative_int_env("MLX_ROCM_GEMM_F32_SOLUTION_INDEX", 0);
-  static int batched_index = parse_non_negative_int_env(
-      "MLX_ROCM_GEMM_F32_BATCHED_SOLUTION_INDEX", -1);
-  if (!batched) {
-    return single_index;
-  }
-  return batched_index >= 0 ? batched_index : single_index;
+// The dequantized-weight LRU of the DequantGemm route and its counters
+// (lablup/mlxcel#2151). The counters are relaxed atomics, bumped once per
+// GEMM on the route and never read on the hot path; rocm::dequant_cache_stats
+// reads them with the entry count and bytes. MLX_ROCM_QMM_DEQUANT_CACHE_STATS=1
+// prints them on stderr when the process exits.
+struct DequantCacheCounters {
+  std::atomic<uint64_t> hits{0};
+  std::atomic<uint64_t> misses{0};
+  std::atomic<uint64_t> inserts{0};
+  std::atomic<uint64_t> evictions{0};
+  std::atomic<uint64_t> bypasses{0};
+};
+
+DequantCacheCounters g_dequant_cache_counters;
+
+inline void count_dequant_cache(std::atomic<uint64_t>& counter) {
+  counter.fetch_add(1, std::memory_order_relaxed);
 }
 
-inline int qmm_gemm_solution_index_bf16(bool batched) {
-  static int single_index =
-      parse_non_negative_int_env("MLX_ROCM_GEMM_BF16_SOLUTION_INDEX", 0);
-  static int batched_index = parse_non_negative_int_env(
-      "MLX_ROCM_GEMM_BF16_BATCHED_SOLUTION_INDEX", -1);
-  if (!batched) {
-    return single_index;
+struct DequantCache {
+  std::mutex mutex;
+  std::list<DequantCacheKey> lru;
+  size_t cached_bytes = 0;
+  std::unordered_map<DequantCacheKey, DequantCacheEntry, DequantCacheKeyHasher>
+      entries;
+
+  // Drops least recently used entries until both limits hold. Call with
+  // `mutex` held.
+  void evict_to(int capacity, size_t max_bytes) {
+    while (!lru.empty() &&
+           (static_cast<int>(entries.size()) > capacity ||
+            cached_bytes > max_bytes)) {
+      auto evict_it = entries.find(lru.back());
+      if (evict_it != entries.end()) {
+        cached_bytes -= evict_it->second.bytes;
+        entries.erase(evict_it);
+        count_dequant_cache(g_dequant_cache_counters.evictions);
+      }
+      lru.pop_back();
+    }
   }
-  return batched_index >= 0 ? batched_index : single_index;
+};
+
+void print_dequant_cache_stats();
+
+// The process-wide cache. The exit report is registered after the cache is
+// constructed, so it runs before the cache is destroyed.
+DequantCache& dequant_cache() {
+  static DequantCache cache;
+  static const bool report_registered = [] {
+    const char* e = std::getenv("MLX_ROCM_QMM_DEQUANT_CACHE_STATS");
+    if (e && e[0] == '1' && e[1] == '\0') {
+      std::atexit(print_dequant_cache_stats);
+      return true;
+    }
+    return false;
+  }();
+  (void)report_registered;
+  return cache;
+}
+
+rocm::DequantCacheStats read_dequant_cache_stats() {
+  rocm::DequantCacheStats stats{};
+  const auto& c = g_dequant_cache_counters;
+  stats.hits = c.hits.load(std::memory_order_relaxed);
+  stats.misses = c.misses.load(std::memory_order_relaxed);
+  stats.inserts = c.inserts.load(std::memory_order_relaxed);
+  stats.evictions = c.evictions.load(std::memory_order_relaxed);
+  stats.bypasses = c.bypasses.load(std::memory_order_relaxed);
+  auto& cache = dequant_cache();
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  stats.entries = cache.entries.size();
+  stats.bytes = cache.cached_bytes;
+  return stats;
+}
+
+void print_dequant_cache_stats() {
+  const auto s = read_dequant_cache_stats();
+  std::fprintf(
+      stderr,
+      "[ROCm] qmm dequant cache: hits=%llu misses=%llu inserts=%llu "
+      "evictions=%llu bypassed=%llu entries=%zu bytes=%zu\n",
+      static_cast<unsigned long long>(s.hits),
+      static_cast<unsigned long long>(s.misses),
+      static_cast<unsigned long long>(s.inserts),
+      static_cast<unsigned long long>(s.evictions),
+      static_cast<unsigned long long>(s.bypasses),
+      s.entries,
+      s.bytes);
 }
 
 inline rocblas_operation to_rocblas_op(bool transpose) {
@@ -1320,8 +1370,6 @@ void dequant_rocblas_gemm(
   void* c_ptr = gpu_ptr<void>(c);
 
   enc.launch_kernel([&, a_ptr, b_ptr, c_ptr](hipStream_t stream) {
-    enc.device().set_rocblas_stream(stream);
-    rocblas_handle handle = enc.device().get_rocblas_handle();
 
     rocblas_operation op_a = to_rocblas_op(transpose_a);
     rocblas_operation op_b = to_rocblas_op(transpose_b);
@@ -1348,11 +1396,16 @@ void dequant_rocblas_gemm(
       }
     }
 
+    // Taken after the hipBLASLt attempt so hipBLASLt GEMMs never hold the
+    // rocBLAS lease.
+    auto lease = enc.device().acquire_rocblas(stream);
+    rocblas_handle handle = lease.handle();
+
     switch (dtype) {
       case float32: {
         float alpha_f = alpha;
         float beta_f = beta;
-        int solution_index = qmm_gemm_solution_index_f32(false);
+        int solution_index = rocm::gemm_solution_index_f32(false);
         static std::atomic<bool> solution_valid{true};
 
         if (solution_index > 0 &&
@@ -1464,7 +1517,7 @@ void dequant_rocblas_gemm(
           }
         }
 
-        int solution_index = qmm_gemm_solution_index_bf16(false);
+        int solution_index = rocm::gemm_solution_index_bf16(false);
         static std::atomic<bool> solution_valid{true};
 
         rocblas_gemm_algo algo = rocblas_gemm_algo_standard;
@@ -1563,8 +1616,8 @@ void dequant_rocblas_gemm_batched(
   void* c_ptr = gpu_ptr<void>(c);
 
   enc.launch_kernel([&, a_ptr, b_ptr, c_ptr](hipStream_t stream) {
-    enc.device().set_rocblas_stream(stream);
-    rocblas_handle handle = enc.device().get_rocblas_handle();
+    auto lease = enc.device().acquire_rocblas(stream);
+    rocblas_handle handle = lease.handle();
 
     rocblas_operation op_a = to_rocblas_op(transpose_a);
     rocblas_operation op_b = to_rocblas_op(transpose_b);
@@ -1573,7 +1626,7 @@ void dequant_rocblas_gemm_batched(
       case float32: {
         float alpha_f = alpha;
         float beta_f = beta;
-        int solution_index = qmm_gemm_solution_index_f32(true);
+        int solution_index = rocm::gemm_solution_index_f32(true);
         static std::atomic<bool> solution_valid{true};
 
         if (solution_index > 0 &&
@@ -1683,7 +1736,7 @@ void dequant_rocblas_gemm_batched(
       case bfloat16: {
         float alpha_f = alpha;
         float beta_f = beta;
-        int solution_index = qmm_gemm_solution_index_bf16(true);
+        int solution_index = rocm::gemm_solution_index_bf16(true);
         static std::atomic<bool> solution_valid{true};
 
         rocblas_gemm_algo algo = rocblas_gemm_algo_standard;
@@ -1866,6 +1919,19 @@ __device__ inline float fp4_e2m1_to_float(uint8_t val) {
     default:
       return 0.0f;
   }
+}
+
+// mlxcelverse: an fp4 (e2m1) nibble decoded without a branch, as its value
+// times 2^-14. The sign bit and the three magnitude bits (two exponent bits,
+// one mantissa bit) land in an fp16's sign bit, low exponent bits and top
+// mantissa bit, so exponent 0 becomes the fp16 subnormal 0 or 2^-15 and the
+// rest are normal; v_cvt_f32_f16 widens both exactly. Callers multiply the
+// accumulated dot product by 2^14 (kFp4HalfBitsScale), which is exact.
+constexpr float kFp4HalfBitsScale = 16384.0f;
+__device__ __forceinline__ float fp4_e2m1_to_float_scaled(uint32_t nibble) {
+  const uint16_t h =
+      static_cast<uint16_t>(((nibble & 0x8u) << 12) | ((nibble & 0x7u) << 9));
+  return static_cast<float>(__builtin_bit_cast(_Float16, h));
 }
 
 __device__ __forceinline__ float fp8_e4m3_to_float(uint8_t val) {
@@ -3439,7 +3505,13 @@ bool quantized_matmul_runs_dequant_gemm(
   // and fall back to different rocBLAS calls, so only the hipBLASLt case is
   // claimed. The claim assumes the hipBLASLt launch itself does not throw,
   // which would send each side to its own rocBLAS fallback.
-  return route == QmmRoute::DequantGemm && is_hipblaslt_available();
+  return (route == QmmRoute::DequantGemm ||
+          route == QmmRoute::DequantGemmAboveWmmaCeiling) &&
+      is_hipblaslt_available();
+}
+
+DequantCacheStats dequant_cache_stats() {
+  return read_dequant_cache_stats();
 }
 
 } // namespace rocm
@@ -3482,6 +3554,22 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   bool x_singleton_batch = has_only_singleton_batch_dims(x);
   bool w_singleton_batch = has_only_singleton_batch_dims(w);
+
+  // An unbatched weight against a row-contiguous batched activation is one
+  // GEMM of batch * M rows, which is how the Metal backend reads it
+  // (`M = x.size() / K` when `w.ndim() == 2` and x is row contiguous). Kept as
+  // a batch, a decode batch's [B, 1, K] activation took the batched qmv
+  // kernel, which streams the whole weight once per batch element: on gfx1151
+  // a batch-4 Meta-Llama-3.1-8B 4-bit decode step cost 158 ms against 31 ms
+  // at batch 1 (lablup/mlxcel#2156). The output is allocated row contiguous,
+  // so [batch, M, N] and [batch * M, N] are the same bytes.
+  if (batch_count > 1 && w_singleton_batch && x_batch_count == batch_count &&
+      x.flags().row_contiguous) {
+    M *= batch_count;
+    batch_count = 1;
+    x_batch_count = 1;
+    x_singleton_batch = true;
+  }
   bool non_batched =
       (batch_count == 1) && x_singleton_batch && w_singleton_batch;
 
@@ -3552,7 +3640,9 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   // Dequant + rocBLAS GEMM path
   // Disable with MLX_ROCM_QMM_DEQUANT_GEMM=0 if needed
-  if (route == QmmRoute::DequantGemm || route == QmmRoute::DequantFp8Gemm) {
+  if (route == QmmRoute::DequantGemm ||
+      route == QmmRoute::DequantGemmAboveWmmaCeiling ||
+      route == QmmRoute::DequantFp8Gemm) {
     if (!((x_batch_count == 1) || (x_batch_count == batch_count))) {
       throw std::runtime_error(
           "Unsupported x batch shape for dequant GEMM fallback");
@@ -3595,15 +3685,16 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     bool cache_hit = false;
     int cache_cap = dequant_cache_capacity();
     size_t cache_max_bytes = dequant_cache_max_bytes();
-    if (cache_cap > 0 && cache_max_bytes > 0) {
-      static std::mutex cache_mutex;
-      static std::list<DequantCacheKey> lru;
-      static size_t cached_bytes = 0;
-      static std::unordered_map<
-          DequantCacheKey,
-          DequantCacheEntry,
-          DequantCacheKeyHasher>
-          cache;
+    // Above the WMMA ceiling the cache is skipped: the weight is dequantized
+    // into a temporary below, as with the cache turned off.
+    const bool use_cache = route == QmmRoute::DequantGemm && cache_cap > 0 &&
+        cache_max_bytes > 0;
+    if (route == QmmRoute::DequantGemmAboveWmmaCeiling) {
+      dequant_cache(); // registers the exit report, if requested
+      count_dequant_cache(g_dequant_cache_counters.bypasses);
+    }
+    if (use_cache) {
+      auto& c = dequant_cache();
 
       DequantCacheKey key{
           reinterpret_cast<std::uintptr_t>(gpu_ptr<void>(w)),
@@ -3617,14 +3708,18 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           x.dtype()};
 
       {
-        std::lock_guard<std::mutex> lock(cache_mutex);
-        auto it = cache.find(key);
-        if (it != cache.end() && it->second.weight.shape() == w_dequant_shape) {
-          lru.splice(lru.begin(), lru, it->second.lru_it);
+        std::lock_guard<std::mutex> lock(c.mutex);
+        auto it = c.entries.find(key);
+        if (it != c.entries.end() &&
+            it->second.weight.shape() == w_dequant_shape) {
+          c.lru.splice(c.lru.begin(), c.lru, it->second.lru_it);
           w_dequant = it->second.weight;
           cache_hit = true;
         }
       }
+      count_dequant_cache(
+          cache_hit ? g_dequant_cache_counters.hits
+                    : g_dequant_cache_counters.misses);
 
       if (!cache_hit) {
         w_dequant.set_data(mlx::core::rocm::malloc_async(w_dequant.nbytes(), enc));
@@ -3636,13 +3731,13 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           fp_dequantize(w, scales, w_dequant, group_size_, bits_, enc, s);
         }
 
-        std::lock_guard<std::mutex> lock(cache_mutex);
-        auto it = cache.find(key);
-        if (it == cache.end()) {
+        std::lock_guard<std::mutex> lock(c.mutex);
+        auto it = c.entries.find(key);
+        if (it == c.entries.end()) {
           size_t entry_bytes = w_dequant.nbytes();
           if (entry_bytes <= cache_max_bytes) {
-            lru.push_front(key);
-            cache.emplace(
+            c.lru.push_front(key);
+            c.entries.emplace(
                 key,
                 DequantCacheEntry{
                     w_dequant,
@@ -3650,47 +3745,30 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
                     scales,
                     has_bias ? std::optional<array>(*biases) : std::nullopt,
                     entry_bytes,
-                    lru.begin()});
-            cached_bytes += entry_bytes;
-
-            while (static_cast<int>(cache.size()) > cache_cap ||
-                   cached_bytes > cache_max_bytes) {
-              auto evict = lru.back();
-              auto evict_it = cache.find(evict);
-              if (evict_it != cache.end()) {
-                cached_bytes -= evict_it->second.bytes;
-                cache.erase(evict_it);
-              }
-              lru.pop_back();
-            }
+                    c.lru.begin()});
+            c.cached_bytes += entry_bytes;
+            count_dequant_cache(g_dequant_cache_counters.inserts);
+            c.evict_to(cache_cap, cache_max_bytes);
           }
         } else {
           size_t entry_bytes = w_dequant.nbytes();
           if (entry_bytes > cache_max_bytes) {
-            cached_bytes -= it->second.bytes;
-            lru.erase(it->second.lru_it);
-            cache.erase(it);
+            c.cached_bytes -= it->second.bytes;
+            c.lru.erase(it->second.lru_it);
+            c.entries.erase(it);
+            count_dequant_cache(g_dequant_cache_counters.evictions);
           } else {
-            cached_bytes -= it->second.bytes;
+            c.cached_bytes -= it->second.bytes;
             it->second.w_source = w;
             it->second.scales_source = scales;
             it->second.biases_source =
                 has_bias ? std::optional<array>(*biases) : std::nullopt;
             it->second.weight = w_dequant;
             it->second.bytes = entry_bytes;
-            cached_bytes += it->second.bytes;
-            lru.splice(lru.begin(), lru, it->second.lru_it);
-
-            while (static_cast<int>(cache.size()) > cache_cap ||
-                   cached_bytes > cache_max_bytes) {
-              auto evict = lru.back();
-              auto evict_it = cache.find(evict);
-              if (evict_it != cache.end()) {
-                cached_bytes -= evict_it->second.bytes;
-                cache.erase(evict_it);
-              }
-              lru.pop_back();
-            }
+            c.cached_bytes += it->second.bytes;
+            c.lru.splice(c.lru.begin(), c.lru, it->second.lru_it);
+            count_dequant_cache(g_dequant_cache_counters.inserts);
+            c.evict_to(cache_cap, cache_max_bytes);
           }
         }
       }
@@ -3828,10 +3906,17 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   // TILE_N is passed as a runtime argument — no template instantiation needed.
   auto hw_info = detect_rocm_hw_info(enc.device());
   auto arch_tuning = rocm::get_arch_tuning(hw_info);
-  int tile_n = arch_tuning.qmv_tile_n;
-  // Allow env override for benchmarking
-  if (auto env = std::getenv("MLX_ROCM_QMV_TILE_N"); env && *env)
-    tile_n = std::atoi(env);
+  // Env override for benchmarking; 0 (unset) keeps the per-arch value. The
+  // block is (warp, tile_n), and the tiled kernels' launch bounds allow at
+  // most TILE_N_MAX columns.
+  static const int env_tile_n = rocm::env_int_or_default(
+      "MLX_ROCM_QMV_TILE_N",
+      0,
+      1,
+      rocm::TILE_N_MAX,
+      "an integer from 1 to 32",
+      "the per-architecture default");
+  int tile_n = env_tile_n > 0 ? env_tile_n : arch_tuning.qmv_tile_n;
   // Ensure N alignment
   while (tile_n > 1 && N % tile_n != 0) tile_n /= 2;
 
@@ -4567,7 +4652,8 @@ __device__ inline void find_sorted_expert_run(
 }
 
 // ======================================================================
-// GPU-only expert-batched gather QMV for sorted indices (affine, 4 or 8 bits).
+// GPU-only expert-batched gather QMV for sorted indices (affine at 4 or 8
+// bits, or mxfp4).
 //
 // Grid: (M, ceil(N/cols_per_block), E). Block z handles expert z: it finds
 // that expert's run of the sorted rhs_indices with two binary searches (no
@@ -4585,6 +4671,11 @@ __device__ inline void find_sorted_expert_run(
 // wrong whenever MLX broadcasts the indices (for example x [T, 1, K] with
 // sorted rhs_indices [T, 1], a [T, T] batch), and read past both arrays
 // (LOCAL_FIXES.md item 9).
+//
+// mlxcelverse: AFFINE=false is mxfp4 (lablup/mlxcel#2106): one E8M0 byte of
+// scale per group of 32 and no biases. A word holds eight e2m1 nibbles, all in
+// one group; each is decoded as its value times 2^-14 and the row's dot product
+// for the word is scaled back by 2^14 with the group's scale.
 // ======================================================================
 template <
     typename T,
@@ -4613,8 +4704,10 @@ __global__ void __launch_bounds__(1024) gather_qmv_expert_batched_kernel(
     bool has_bias,
     bool implicit_lhs,
     int64_t implicit_x_batch_stride) {
-  static_assert(AFFINE && (BITS == 4 || BITS == 8),
-                "expert-batched gather qmv is affine 4/8-bit only");
+  static_assert(
+      (AFFINE && (BITS == 4 || BITS == 8)) ||
+          (!AFFINE && BITS == 4 && GROUP_SIZE == 32),
+      "expert-batched gather qmv is affine 4/8-bit or mxfp4 only");
   // Values per packed 32-bit word, and rows sharing one load of a word.
   constexpr int VALS = 32 / BITS;
   constexpr int TOKENS = 4;
@@ -4695,7 +4788,12 @@ __global__ void __launch_bounds__(1024) gather_qmv_expert_batched_kernel(
       float wv[VALS];
 #pragma unroll
       for (int j = 0; j < VALS; ++j) {
-        wv[j] = static_cast<float>((packed >> (BITS * j)) & ((1u << BITS) - 1));
+        const uint32_t q = (packed >> (BITS * j)) & ((1u << BITS) - 1);
+        if constexpr (AFFINE) {
+          wv[j] = static_cast<float>(q);
+        } else {
+          wv[j] = fp4_e2m1_to_float_scaled(q);
+        }
       }
 #pragma unroll
       for (int t = 0; t < TOKENS; ++t) {
@@ -4708,7 +4806,13 @@ __global__ void __launch_bounds__(1024) gather_qmv_expert_batched_kernel(
           qx = fmaf(xv, wv[j], qx);
           xs += xv;
         }
-        acc[t] = fmaf(scale, qx, fmaf(bias_val, xs, acc[t]));
+        if constexpr (AFFINE) {
+          acc[t] = fmaf(scale, qx, fmaf(bias_val, xs, acc[t]));
+        } else {
+          (void)xs;
+          (void)bias_val;
+          acc[t] = fmaf(scale, qx * kFp4HalfBitsScale, acc[t]);
+        }
       }
     }
 
@@ -5119,7 +5223,39 @@ __global__ void __launch_bounds__(1024) gather_qmv_warp_shared_kernel(
     }
     __syncthreads();
 
-    if (valid) {
+    // mlxcelverse: mxfp4 (4-bit e2m1, group size 32, one E8M0 scale byte per
+    // group, no biases) walks packed words across the whole chunk instead of
+    // looping per group. With the per-group loop below, lanes start at
+    // lane * 8 inside each 32-value group, so only lanes 0 to 3 of 16 did work
+    // and the decode went through the branchy fp4_e2m1_to_float switch. Here
+    // every lane takes one 8-value word per step: the word's eight nibbles
+    // sit in one group (8 divides 32), so each word reads one scale, decodes
+    // without a branch (fp4_e2m1_to_float_scaled, the value times 2^-14) and
+    // scales its dot product back by 2^14, as the expert-batched kernel does
+    // (LOCAL_FIXES.md item 31). The dispatch sends only K % 32 == 0 here, and
+    // CHUNK_SIZE is a multiple of 32, so no word straddles a chunk end.
+    constexpr bool kMxfp4WordPath = !AFFINE && BITS == 4 && GROUP_SIZE == 32;
+    if constexpr (kMxfp4WordPath) {
+      if (valid) {
+        for (int k = chunk_start + lane * 8; k < chunk_end;
+             k += THREADS_PER_COL * 8) {
+          const uint32_t packed =
+              *reinterpret_cast<const uint32_t*>(&w_row[k / 2]);
+          const float scale = load_scale_value<ScaleT, GROUP_SIZE, false>(
+              scales_row[k / GROUP_SIZE]);
+          const float* xs = &shared_x[k - chunk_start];
+          float qx = 0.0f;
+#pragma unroll
+          for (int j = 0; j < 8; ++j) {
+            qx = fmaf(
+                xs[j], fp4_e2m1_to_float_scaled((packed >> (4 * j)) & 0xFu), qx);
+          }
+          acc = fmaf(scale, qx * kFp4HalfBitsScale, acc);
+        }
+      }
+    }
+
+    if (!kMxfp4WordPath && valid) {
       int g_start = chunk_start / GROUP_SIZE;
       int g_end = (chunk_end + GROUP_SIZE - 1) / GROUP_SIZE;
 
@@ -6078,10 +6214,12 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     const char* e = std::getenv("MLX_ROCM_GROUPED_PREFILL");
     return e && std::atoi(e) != 0;  // opt-in; WIP, regresses until kernel+GPU-grouping land
   }();
-  static const int kGroupedPrefillMinB = [] {
-    const char* e = std::getenv("MLX_ROCM_GROUPED_PREFILL_MIN_B");
-    return e ? std::atoi(e) : 64;
-  }();
+  static const int kGroupedPrefillMinB = rocm::env_int_or_default(
+      "MLX_ROCM_GROUPED_PREFILL_MIN_B",
+      64,
+      1,
+      std::numeric_limits<int>::max(),
+      "a positive integer");
   if (kGroupedPrefillEnabled && M == 1 && B >= kGroupedPrefillMinB && transpose_ &&
       E > 0 && batch_ndim == 1 &&
       mode_ == QuantizationMode::Affine && x.dtype() == bfloat16 &&
@@ -6145,12 +6283,20 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
       // routing imbalance, far fewer empty blocks than ceil(B/64), and crucially
       // NO max_run_len readback (that needed a full pipeline-draining
       // enc.synchronize() per gather_qmm call, which tanked small-input PP/s).
-      static const int gridx_mult = [] {
-        const char* e = std::getenv("MLX_GRIDX_MULT");
-        return e ? std::max(1, std::atoi(e)) : 4;
-      }();
+      static const int gridx_mult = rocm::env_int_or_default(
+          "MLX_GRIDX_MULT",
+          4,
+          1,
+          std::numeric_limits<int>::max(),
+          "a positive integer");
       const int avg_tiles = ((B + E - 1) / E + 63) / 64;
-      int grid_x = std::max(1, std::min((B + 63) / 64, avg_tiles * gridx_mult));
+      // In 64 bits: a large MLX_GRIDX_MULT must clamp to the tile count, not
+      // overflow.
+      int grid_x = std::max(
+          1,
+          static_cast<int>(std::min<int64_t>(
+              (B + 63) / 64,
+              static_cast<int64_t>(avg_tiles) * gridx_mult)));
       dim3 wmma_block(128, 1, 1);          // 4 warps
       dim3 wmma_grid(grid_x, (N + 127) / 128, E);
       enc.add_kernel_node_ex(
@@ -6185,16 +6331,27 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   // Beneficial when few experts have many tokens each. For high-expert-count
   // models (E=512, top_k=10), most runs have 1-4 tokens, so it is limited to
   // E <= 64 with at least 4 rows per expert on average (a prefill).
-  bool use_expert_batched = transpose_ && right_sorted_ && (M == 1) &&
-      (B >= 64) && (E > 0) && (E <= 64) && (B / E >= 4) &&
-      mode_ == QuantizationMode::Affine &&
+  // mlxcelverse: mxfp4 (group size 32, E8M0 scales, no biases) with bf16
+  // activations takes the same kernel since lablup/mlxcel#2106: gpt-oss-20b
+  // spent 99.8% of its prefill in the per-row gather_qmv_kernel. Only the
+  // bf16 instantiation is added (gpt-oss runs bf16 activations), to keep the
+  // ahead-of-time compile cost down; f16 mxfp4 and mxfp8 keep the per-row
+  // kernel.
+  const bool eb_affine = mode_ == QuantizationMode::Affine &&
       (x.dtype() == bfloat16 || x.dtype() == float16) && group_size_ == 64 &&
       (bits_ == 4 || bits_ == 8);
+  const bool eb_mxfp4 = mode_ == QuantizationMode::Mxfp4 &&
+      x.dtype() == bfloat16 && group_size_ == 32 && bits_ == 4;
+  bool use_expert_batched = transpose_ && right_sorted_ && (M == 1) &&
+      (B >= 64) && (E > 0) && (E <= 64) && (B / E >= 4) &&
+      (eb_affine || eb_mxfp4);
   // mlxcelverse: on by default since lablup/mlxcel#2066, which fixed its
   // strided index reads (LOCAL_FIXES.md item 9) and measured 512-token prefill
   // on gfx1151 at 1.7x (granite-4.0-h-tiny, bf16) and 4.8x (Mixtral-8x7B,
-  // f16) the per-row kernels. MLX_ROCM_GATHER_QMV_EXPERT_BATCHED=0 turns it
-  // off; the variable is read on every call.
+  // f16) the per-row kernels; lablup/mlxcel#2106 measured mxfp4 (gpt-oss-20b,
+  // bf16) at about 70x (LOCAL_FIXES.md item 31).
+  // MLX_ROCM_GATHER_QMV_EXPERT_BATCHED=0 turns it off for every scheme; the
+  // variable is read on every call.
   use_expert_batched = use_expert_batched &&
       parse_warp_kernel_env("MLX_ROCM_GATHER_QMV_EXPERT_BATCHED", true);
 
@@ -6239,10 +6396,26 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         else
           launch_eb(type_tag, std::integral_constant<int, 8>{});
       };
-      if (x.dtype() == float16)
+      if (eb_mxfp4) {
+        enc.add_kernel_node(
+            &rocm::gather_qmv_expert_batched_kernel<
+                hip_bfloat16, uint8_t, 4, 32, false, 16>,
+            eb_grid, eb_block, 0u,
+            (const hip_bfloat16*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const uint8_t*)scales_ptr,
+            static_cast<const uint8_t*>(nullptr),
+            li_ptr, ri_ptr,
+            batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param,
+            batch_ndim,
+            (hip_bfloat16*)out_ptr,
+            B, M, N, K, E, false,
+            use_sorted_rhs_schedule, implicit_x_batch_stride);
+      } else if (x.dtype() == float16) {
         launch_eb_bits(local_type_identity<__half>{});
-      else
+      } else {
         launch_eb_bits(local_type_identity<hip_bfloat16>{});
+      }
     }
     return;
   }
@@ -6491,13 +6664,76 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
       return;
     }
 
+    // mlxcelverse: bf16 mxfp4 at group size 32 takes the warp-shared kernel's
+    // AFFINE=false word path (lablup/mlxcel#2178). Before, it fell to the
+    // per-row gather_qmv_kernel below, one thread per output column walking
+    // all of K, which took about 1.39 ms per call and most of a gpt-oss-20b
+    // decode step on gfx1151. Only bf16 is instantiated (gpt-oss runs bf16
+    // activations), to hold the file's compile time; f16 mxfp4 and mxfp8 keep
+    // the per-row kernel. MLX_ROCM_GATHER_QMV_USE_WARP=0 sends this case back
+    // to the per-row kernel too. A thread count set through
+    // MLX_ROCM_GATHER_QMV_THREADS_PER_COL that matches neither instantiation
+    // also stays on the per-row kernel, since the kernel's lane reduction
+    // assumes the block's x dimension equals THREADS_PER_COL.
+    if (use_fast_gather_qmv && mode_ == QuantizationMode::Mxfp4 &&
+        x.dtype() == bfloat16 && group_size_ == 32 && bits_ == 4 &&
+        K % 32 == 0 &&
+        (fast_threads_per_col == 16 || fast_threads_per_col == WARP_SIZE)) {
+      auto launch_mxfp4 = [&](auto kernel) {
+        enc.add_kernel_node(
+            kernel,
+            fast_grid,
+            fast_block,
+            0u,
+            (const hip_bfloat16*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const uint8_t*)scales_ptr,
+            static_cast<const uint8_t*>(nullptr),
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (hip_bfloat16*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            false,
+            use_sorted_rhs_schedule,
+            implicit_x_batch_stride);
+      };
+      if (fast_threads_per_col == 16) {
+        launch_mxfp4(&rocm::gather_qmv_warp_shared_kernel<
+                     hip_bfloat16,
+                     uint8_t,
+                     4,
+                     32,
+                     false,
+                     16>);
+      } else {
+        launch_mxfp4(&rocm::gather_qmv_warp_shared_kernel<
+                     hip_bfloat16,
+                     uint8_t,
+                     4,
+                     32,
+                     false,
+                     WARP_SIZE>);
+      }
+      return;
+    }
+
 #define has_bias has_bias, use_sorted_rhs_schedule, implicit_x_batch_stride
 
     // mlxcelverse: mxfp4/mxfp8 store one E8M0 byte per group and no biases,
     // but every launch below instantiates the kernel with AFFINE=true and a
     // T-typed scale pointer, which dequantizes fp weights with the affine
     // formula. Route non-affine modes to the AFFINE=false instantiation with
-    // uint8_t scales instead.
+    // uint8_t scales instead. bf16 mxfp4 at group size 32 with K % 32 == 0
+    // takes the warp-shared arm above unless MLX_ROCM_GATHER_QMV_USE_WARP=0;
+    // f16 and f32 mxfp4, mxfp8 and that switch reach this per-row kernel.
     if (mode_ != QuantizationMode::Affine) {
       if (group_size_ != 32 || (bits_ != 4 && bits_ != 8)) {
         throw std::runtime_error(

@@ -14,6 +14,10 @@ bool is_available() {
   return false;
 }
 
+int device_warp_size() {
+  return 0;
+}
+
 bool train_arena_begin(size_t) {
   return false;
 }
@@ -61,6 +65,10 @@ bool quantized_matmul_runs_dequant_gemm(
     int,
     int) {
   return false;
+}
+
+DequantCacheStats dequant_cache_stats() {
+  return DequantCacheStats{};
 }
 
 } // namespace rocm

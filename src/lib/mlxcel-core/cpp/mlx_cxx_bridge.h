@@ -12,6 +12,16 @@
 
 namespace mlx_cxx {
 
+// A copy of the pinned MLX KeySequence retains only its lazy key array.
+// Its public copy/assignment operations let failed fused submits restore the
+// calling thread's RNG without evaluating a graph or adding a GPU schedule.
+struct MlxRngSnapshot {
+    mlx::core::random::KeySequence inner;
+    MlxRngSnapshot() : inner(mlx::core::random::KeySequence::default_()) {}
+};
+std::unique_ptr<MlxRngSnapshot> rng_snapshot();
+void restore_rng_snapshot(const MlxRngSnapshot& snapshot);
+
 // Opaque wrapper struct to hold mlx::core::array
 // This allows cxx to manage the lifetime without exposing the complex internals
 struct MlxArray {
@@ -50,7 +60,7 @@ struct MlxStream {
 // across threads gives every thread its own dedicated MLX stream
 // without any explicit coordination between them. Used by
 // `mlxcel-core` to back the generation stream of `BatchScheduler`,
-// `CxxGenerator`, and `SpeculativeGenerator` (upstream MLX commit `728fab1` in mlx-vlm PR #1050).
+// the engine's raw-completion client, and `SpeculativeGenerator` (upstream MLX commit `728fab1` in mlx-vlm PR #1050).
 struct MlxThreadLocalStream {
     mlx::core::ThreadLocalStream inner;
 
@@ -1126,29 +1136,6 @@ std::unique_ptr<MlxArray> fast_scaled_dot_product_attention_causal(
     float scale
 );
 
-// Decode-only paged attention over dense compatibility KV caches.
-std::unique_ptr<MlxArray> paged_decode_attention_dense_compat(
-    const MlxArray& q,
-    rust::Slice<const MlxArray* const> cache_keys,
-    rust::Slice<const MlxArray* const> cache_values,
-    rust::Slice<const int32_t> kv_lens,
-    rust::Slice<const int32_t> block_tables,
-    rust::Slice<const int32_t> block_table_offsets,
-    int32_t block_size,
-    float scale
-);
-
-// Decode-only paged attention over rotating ring-buffer KV caches.
-std::unique_ptr<MlxArray> paged_decode_attention_rotating_compat(
-    const MlxArray& q,
-    rust::Slice<const MlxArray* const> cache_keys,
-    rust::Slice<const MlxArray* const> cache_values,
-    rust::Slice<const int32_t> kv_lens,
-    rust::Slice<const int32_t> logical_starts,
-    int32_t block_size,
-    float scale
-);
-
 // Upstream MLX SDPA capability helpers for Metal/NAX instrumentation.
 bool sdpa_supports_fast_path(
     const MlxArray& q,
@@ -1381,6 +1368,10 @@ uint64_t count_astype_nodes_pair(const MlxArray& a, const MlxArray& b);
 // Human-readable AsType breakdown (counts + per src->dst dtype pair) for a pair.
 rust::String astype_breakdown_pair(const MlxArray& a, const MlxArray& b);
 
+// Sorted flags of every GatherMM / GatherQMM node below `out`, three bytes per
+// node in depth-first discovery order: quantized, left_sorted, right_sorted.
+rust::Vec<uint8_t> gather_sorted_flags_raw(const MlxArray& out);
+
 // Set default stream for subsequent operations
 void set_default_stream(const MlxStream& stream);
 
@@ -1410,6 +1401,23 @@ bool custom_kernels_available();
 // `device_info()` keys happen to be present.
 int32_t gpu_backend_kind();
 
+// Wavefront-width hold on ROCm ports (lablup/mlxcel#2147); see
+// `src/lib/mlx-cpp/turbo/gpu_backend.h`. `rocm_port_allowed` is the pure rule
+// `port_for` applies, `rocm_device_warp_size` the hardware width of the
+// current HIP device (0 off ROCm or when the query fails, never the
+// `MLX_ROCM_FORCE_WARP_SIZE` override), and
+// `set_rocm_port_warp_size_for_tests` the test-only seam that replaces the
+// width `port_for` sees (0 restores the hardware value).
+bool rocm_port_allowed(bool any_wave_size, int32_t warp_size);
+int32_t rocm_device_warp_size();
+
+// Counters of the ROCm QuantizedMatmul dequantized-weight cache
+// (lablup/mlxcel#2151), as `mlx::core::rocm::dequant_cache_stats()` returns
+// them: hits, misses, inserts, evictions, bypasses, entries, bytes, in that
+// order. Seven zeros off ROCm.
+rust::Vec<uint64_t> rocm_dequant_cache_stats();
+void set_rocm_port_warp_size_for_tests(int32_t warp_size);
+
 // Test-only (lablup/mlxcel#1804): a lazy array whose evaluation fails on the
 // GPU in a chosen way, built through the same custom-kernel path the fused
 // ports use, so a test can check that a ROCm failure reaches Rust as an `Err`
@@ -1421,9 +1429,31 @@ int32_t gpu_backend_kind();
 // on backends other than ROCm.
 std::unique_ptr<MlxArray> rocm_fault_probe_array(int32_t kind);
 
+// Test-only (lablup/mlxcel#2149): launches one `fast::hip_kernel` under a fixed
+// name with no template args and returns an array of `input.size() + 1`
+// elements, f16 when `f16_output` and f32 otherwise: element 0 is
+// `inp_shape[0]` (-1 for a 0-d input, which has no `inp_shape` parameter) and
+// element `1 + i` is `(float)input[i]`. Calls that differ only in the input's
+// dtype, the output's dtype or the input's 0-d-ness must not share a compiled
+// module; with a name-keyed JIT cache they did. Takes a float32, float16 or
+// bfloat16 input that is 0-d or 1-d with 1 to 1024 elements. Throws on
+// backends other than ROCm.
+std::unique_ptr<MlxArray> rocm_jit_key_probe(const MlxArray& input, bool f16_output);
+
+// Test-only (lablup/mlxcel#2183): launches one `fast::hip_kernel` named
+// `mlxcel_jit_race_probe_v<variant>` in one block of `input.size()` threads and
+// returns a float32 array of that size whose element `i` is
+// `input[i] * 2 + 1`. The first launch of a variant in a process compiles and
+// inserts a JIT module, later launches find it, so threads launching the same
+// or different variants at once exercise the JIT module cache's locking.
+// Takes a 1-d float32 input of 1 to 1024 elements and a non-negative variant.
+// Throws on backends other than ROCm.
+std::unique_ptr<MlxArray> rocm_jit_race_probe_array(const MlxArray& input, int32_t variant);
+
 
 // True when this backend has a BitLinear kernel port: Metal, CUDA or ROCm
-// (issues #1803, #1862).
+// (issues #1803, #1862). Read from the kernel's port table, so on a wave64
+// ROCm device, where that port is held back (#2147), it is false.
 bool bitlinear_kernel_available();
 
 // Fused decode-MoE port predicates (lablup/mlxcel#2065), read from the
@@ -1596,6 +1626,10 @@ bool sampling_rejection_routes(
     float top_p,
     float min_p
 );
+
+// The vocabulary ceiling `sampling_rejection_routes` applies to top-k and
+// top-p together on this build (`REJECTION_JOINT_VOCAB_MAX`, #2157).
+int32_t sampling_rejection_joint_vocab_max();
 
 // Threads per threadgroup the rejection kernel launches with.
 int32_t sampling_rejection_threadgroup_size();

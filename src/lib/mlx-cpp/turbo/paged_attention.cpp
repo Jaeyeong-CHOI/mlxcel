@@ -145,7 +145,8 @@ constexpr const char* PAGED_ATTENTION_DECODE_SOURCE = R"(
         uint block_idx = abs_pos / block_size;
         uint slot = abs_pos - block_idx * block_size;
         uint row = (uint)rows[row_off + block_idx];
-        uint base = (row * block_size + slot) * stride_kv + kv_head * dim;
+        // 64-bit: one slab can hold more than 2^32 elements (#2153).
+        ulong base = ((ulong)row * block_size + slot) * (ulong)stride_kv + kv_head * dim;
 
         float partial = 0.0f;
         for (uint j = 0; j < dpt; j++) {
@@ -298,7 +299,8 @@ constexpr const char* PAGED_ATTENTION_DECODE_CUDA_SOURCE = R"(
         uint32_t block_idx = abs_pos / block_size;
         uint32_t slot = abs_pos - block_idx * block_size;
         uint32_t row = (uint32_t)rows[row_off + block_idx];
-        uint32_t base = (row * block_size + slot) * stride_kv + kv_head * dim;
+        // 64-bit: one slab can hold more than 2^32 elements (#2153).
+        uint64_t base = ((uint64_t)row * block_size + slot) * (uint64_t)stride_kv + kv_head * dim;
 
         float partial = 0.0f;
         for (uint32_t j = 0; j < dpt; j++) {
@@ -566,12 +568,15 @@ mlx::core::array paged_attention_decode(
     // `QType`/`KVType`/`VType` exist to key the JIT cache on the input dtypes
     // and are deliberately unreferenced by the kernel body (issue #1054, same
     // mechanism as #1053). CUDA names a custom kernel
-    // `"custom_kernel_" + name + template_arguments_hash(template_args)` and
-    // memoises the compiled module under that name process-wide, while the
-    // buffer parameter types are generated from the runtime input dtypes. With
-    // int-only args, two callers that share this geometry but differ in pool
-    // dtype get one compiled module and the later one reads through the wrong
-    // pointer type. Metal already folds the dtypes into its key.
+    // `"custom_kernel_" + name + template_arguments_hash(template_args)`, and
+    // at the time memoised the compiled module under that name process-wide,
+    // while the buffer parameter types are generated from the runtime input
+    // dtypes. With int-only args, two callers that share this geometry but
+    // differ in pool dtype got one compiled module and the later one read
+    // through the wrong pointer type. Metal folds the dtypes into its key, and
+    // CUDA (ml-explore/mlx#4273, in the current pin) and ROCm (#2149) now key
+    // the module on a hash of the generated source; these args stay as
+    // defense in depth (`scripts/ci/check_kernel_dtype_keys.py`).
     std::vector<std::pair<std::string, TemplateArg>> template_args = {
         {"Dim", dim},
         {"NRep", n_rep},

@@ -52,10 +52,12 @@
 // gfx90a (#2067). The fold is written not to need it: the 32 lanes that share a
 // `threadIdx.y` are consecutive in the block's linear order, so on a wave64
 // target the explicit width of 32 should keep each butterfly inside its own
-// row (not run: this host has no wave64 device). The
+// row (not run: this host has no wave64 device), which is why both tables stay
+// wave32-only and `port_for` refuses them on a wider device (#2147). The
 // merge body has no lane-level operation (one thread per output element, no
-// shuffle and no barrier), so it is correct for any wavefront size and carries
-// no guard: an `#error` there would only reject a correct kernel.
+// shuffle and no barrier), so it is correct for any wavefront size, carries
+// no guard (an `#error` there would only reject a correct kernel), and
+// `paged_merge_ports()` is marked `rocm_any_wave_size`.
 
 namespace mlxcel::turbo {
 
@@ -134,7 +136,8 @@ inline constexpr const char* PAGED_ATTENTION_DECODE_HIP_SOURCE = R"(
         uint32_t block_idx = abs_pos / block_size;
         uint32_t slot = abs_pos - block_idx * block_size;
         uint32_t row = (uint32_t)rows[row_off + block_idx];
-        uint32_t base = (row * block_size + slot) * stride_kv + kv_head * dim;
+        // 64-bit: one slab can hold more than 2^32 elements (#2153).
+        uint64_t base = ((uint64_t)row * block_size + slot) * (uint64_t)stride_kv + kv_head * dim;
 
         float partial = 0.0f;
         for (uint32_t j = 0; j < dpt; j++) {
@@ -295,7 +298,8 @@ inline constexpr const char* PAGED_ATTENTION_V2_PARTIAL_HIP_SOURCE = R"(
         uint32_t page_off = abs_pos / page_size;
         uint32_t entry = abs_pos - page_off * page_size;
         uint32_t row = (uint32_t)indices[page_begin + page_off];
-        uint32_t base = (row * page_size + entry) * stride_kv + kv_head * dim;
+        // 64-bit: one slab can hold more than 2^32 elements (#2153).
+        uint64_t base = ((uint64_t)row * page_size + entry) * (uint64_t)stride_kv + kv_head * dim;
 
         float k_reg[DimsPerThread];
         float v_reg[DimsPerThread];

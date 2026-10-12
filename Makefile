@@ -804,8 +804,24 @@ verify-rocm-smoke: ## ROCm smoke: build, link and generate on the GPU, asserting
 # "does a real forward pass still run on this device" answer even while the
 # suite is red.
 .PHONY: verify-rocm
-verify-rocm: verify-versions verify-kernel-dtype-keys verify-kernel-port-dispatch verify-llama-compat verify-rocm-overlay verify-fmt verify-clippy-rocm verify-rocm-smoke verify-test-rocm ## Run the ROCm gate locally on an AMD host (issue #1811)
+verify-rocm: verify-versions verify-kernel-dtype-keys verify-kernel-port-dispatch verify-llama-compat verify-rocm-overlay verify-python-tooling verify-fmt verify-clippy-rocm verify-rocm-smoke verify-test-rocm ## Run the ROCm gate locally on an AMD host (issue #1811)
 	@echo "$(GREEN)[verify-rocm] OK$(RESET)"
+
+# The gate for a shared gfx1151 host (issue #2244). Build everything the gate
+# runs without the guard lock, then run `verify-rocm` under one `--hold` of
+# the host-wide lock: the cargo rebuilds inside are cache hits, no
+# other unit's guard can find an idle window in the middle of the gate, and an
+# unguarded `verify-rocm` no longer invalidates everyone else's windows. The
+# test, smoke and clippy builds must stay outside the hold, or the lock would be held through
+# the compile. `verify-rocm` itself is unchanged for hosts with one tenant.
+.PHONY: verify-rocm-held
+verify-rocm-held: ## ROCm gate for a shared host: build unlocked, then run verify-rocm under one rocm_gpu_guard.sh --hold (issue #2244)
+	@echo "$(CYAN)[verify-rocm-held] building the gate's artifacts without the lock...$(RESET)"
+	$(CARGO) test --workspace --profile test-fast $(ROCM_JOBS) --features rocm --no-run
+	$(CARGO) build --release $(ROCM_JOBS) --features rocm
+	$(CARGO) clippy --workspace --all-targets $(ROCM_JOBS) --features rocm -- -D warnings
+	@echo "$(CYAN)[verify-rocm-held] running verify-rocm under one guard lock hold...$(RESET)"
+	@bash scripts/rocm_gpu_guard.sh --hold -- $(MAKE) verify-rocm
 
 .PHONY: verify-versions
 verify-versions: ## Assert every version-tracking workspace crate carries the root `mlxcel` version
@@ -822,10 +838,25 @@ verify-kernel-dtype-keys: ## Assert every CUDA and HIP JIT kernel launch keys it
 	@python3 scripts/ci/check_kernel_dtype_keys.py
 	@bash scripts/ci/check_kernel_dtype_keys_test.sh
 
+# check_kernel_port_dispatch_test.sh is the negative coverage for the ROCm
+# wavefront rules (#2147): it marks a shuffle-based table any-wave, adds a
+# shuffle to a marked body and calls the wave-size test seam from production
+# code in a throwaway copy, and asserts the checker rejects each.
 .PHONY: verify-kernel-port-dispatch
-verify-kernel-port-dispatch: ## Assert every fused-kernel launcher chooses its port through select_kernel_port (issues #1801, #1885)
+verify-kernel-port-dispatch: ## Assert every fused-kernel launcher chooses its port through select_kernel_port, and only lane-free HIP ports run on wave64 (issues #1801, #1885, #2147)
 	@echo "$(CYAN)[verify] kernel port dispatch...$(RESET)"
 	@python3 scripts/ci/check_kernel_port_dispatch.py
+	@bash scripts/ci/check_kernel_port_dispatch_test.sh
+
+# The Python suites under tests/ test the bench, GPU guard, quality gate and
+# header scripts and the Makefile's dev test targets. None needs a GPU, a model
+# or the network. Before #2150 five of the seven ran nowhere, so a script change
+# could break its tests and merge green. rocm_gpu_guard.sh reads Linux /proc, so
+# its test class reports a skip (not a failure) on macOS.
+.PHONY: verify-python-tooling
+verify-python-tooling: ## Run the tests/ Python suites (bench, GPU guard, quality gate, header scripts) (issue #2150)
+	@echo "$(CYAN)[verify] python tooling tests...$(RESET)"
+	@python3 -m unittest discover -s tests -p 'test_*.py'
 
 # Offline half of the mlxcelverse ROCm overlay checks (issue #1813). It reads
 # only files in this repository: patches-rocm/UPSTREAM must name the build's MLX
@@ -990,7 +1021,7 @@ bump-version: ## Release: set every version-tracking crate to VERSION and sync C
 	@$(MAKE) --no-print-directory verify-versions
 
 .PHONY: verify
-verify: verify-versions verify-kernel-dtype-keys verify-kernel-port-dispatch verify-llama-compat verify-rocm-overlay verify-fmt verify-clippy verify-test ## Run the full CI-faithful gate locally (recommended before push)
+verify: verify-versions verify-kernel-dtype-keys verify-kernel-port-dispatch verify-llama-compat verify-rocm-overlay verify-python-tooling verify-fmt verify-clippy verify-test ## Run the full CI-faithful gate locally (recommended before push)
 	@echo "$(GREEN)[verify] OK: matches the nightly-verify GitHub Actions job$(RESET)"
 
 .PHONY: verify-clean
@@ -1194,6 +1225,44 @@ bench-report: ## Show last benchmark results summary
 bench-clean: ## Remove benchmark log
 	@rm -f $(BENCH_LOG)
 	@echo "Benchmark log removed."
+
+# ----------------------------------------------------------------------------
+# Unified-engine baseline tools (issue #2167, ADR 0007, epic #2166)
+# ----------------------------------------------------------------------------
+# `engine-parity` runs one prompt and SamplingConfig through the CLI decode
+# path (CxxGenerator) and the in-process server scheduler at B=1 with dense and
+# with paged decode storage, under MLXCEL_SDPA_DETERMINISTIC=1, and prints the
+# first divergent token per pair. Divergence is the recorded pre-epic baseline
+# and exits 0; PARITY_ARGS=--expect-identical turns it into a gate.
+#
+# `bench-engine` measures single-stream decode tok/s and TTFT on both paths at
+# a short (256-token) and a long (8192-token) synthesized prompt. Pass the A/B
+# knobs through BENCH_ENGINE_ARGS (`--prefill-chunk N`, `--decode-storage
+# dense|paged`, `--path cli|server`). For numbers, run interleaved rounds with
+# a null arm through scripts/engine_bench_rounds.py (ADR 0007 lists the exact
+# commands); a single `make bench-engine` pass is a functional check.
+#
+#   make engine-parity MODEL=models/mlx/qwen3-1.7b-4bit
+#   make bench-engine MODEL=models/mlx/llama-3.2-1b-instruct-4bit
+#
+# ENGINE_PROBE_FEATURES defaults to the platform's accelerator feature (CUDA on
+# Linux, Metal+Accelerate on macOS); set it to `rocm` on a ROCm host.
+ENGINE_PROBE_FEATURES ?= $(WEBUI_TEST_FEATURES)
+ENGINE_PROBE_FEATURE_FLAG := $(if $(ENGINE_PROBE_FEATURES),--features $(ENGINE_PROBE_FEATURES))
+PARITY_ARGS ?=
+BENCH_ENGINE_ARGS ?=
+
+.PHONY: engine-parity
+engine-parity: ## CLI vs server B=1 decode parity harness, bench baseline (MODEL=path, PARITY_ARGS=...)
+	@test -n "$(MODEL)" || { echo "usage: make engine-parity MODEL=<model dir> [PARITY_ARGS=--expect-identical]"; exit 2; }
+	$(CARGO) build --release $(ENGINE_PROBE_FEATURE_FLAG) --bin mlxcel-engine-parity
+	MLXCEL_SDPA_DETERMINISTIC=1 ./target/release/mlxcel-engine-parity --model "$(MODEL)" $(PARITY_ARGS)
+
+.PHONY: bench-engine
+bench-engine: ## B=1 decode benchmark, CLI vs in-process server, short+long context (MODEL=path)
+	@test -n "$(MODEL)" || { echo "usage: make bench-engine MODEL=<model dir> [BENCH_ENGINE_ARGS=...]"; exit 2; }
+	$(CARGO) build --release $(ENGINE_PROBE_FEATURE_FLAG) --bin mlxcel-bench-engine
+	./target/release/mlxcel-bench-engine --model "$(MODEL)" $(BENCH_ENGINE_ARGS)
 
 # ============================================================================
 # Webpage (Next.js static site)

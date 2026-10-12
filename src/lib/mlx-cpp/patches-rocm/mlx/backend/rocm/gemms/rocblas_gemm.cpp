@@ -35,42 +35,6 @@ rocblas_datatype to_rocblas_dtype(Dtype dtype) {
   }
 }
 
-int parse_non_negative_int_env(const char* env_name, int default_value) {
-  const char* raw = std::getenv(env_name);
-  if (raw == nullptr || *raw == '\0') {
-    return default_value;
-  }
-
-  char* end = nullptr;
-  long value = std::strtol(raw, &end, 10);
-  if (end == raw || *end != '\0' || value < 0) {
-    return default_value;
-  }
-  return static_cast<int>(value);
-}
-
-int gemm_solution_index_f32(bool batched) {
-  static int single_index =
-      parse_non_negative_int_env("MLX_ROCM_GEMM_F32_SOLUTION_INDEX", 0);
-  static int batched_index = parse_non_negative_int_env(
-      "MLX_ROCM_GEMM_F32_BATCHED_SOLUTION_INDEX", -1);
-  if (!batched) {
-    return single_index;
-  }
-  return batched_index >= 0 ? batched_index : single_index;
-}
-
-int gemm_solution_index_bf16(bool batched) {
-  static int single_index =
-      parse_non_negative_int_env("MLX_ROCM_GEMM_BF16_SOLUTION_INDEX", 0);
-  static int batched_index = parse_non_negative_int_env(
-      "MLX_ROCM_GEMM_BF16_BATCHED_SOLUTION_INDEX", -1);
-  if (!batched) {
-    return single_index;
-  }
-  return batched_index >= 0 ? batched_index : single_index;
-}
-
 } // namespace
 
 void rocblas_gemm(
@@ -114,8 +78,8 @@ void rocblas_gemm(
   void* c_ptr = gpu_ptr<void>(c);
 
   encoder.launch_kernel([&, a_ptr, b_ptr, c_ptr](hipStream_t stream) {
-    encoder.device().set_rocblas_stream(stream);
-    rocblas_handle handle = encoder.device().get_rocblas_handle();
+    auto lease = encoder.device().acquire_rocblas(stream);
+    rocblas_handle handle = lease.handle();
 
     rocblas_operation op_a = to_rocblas_op(transpose_a);
     rocblas_operation op_b = to_rocblas_op(transpose_b);
@@ -311,30 +275,16 @@ void rocblas_gemm_ptrs(
   if (!encoder.device().is_rocblas_available()) {
     throw std::runtime_error("rocblas_gemm_ptrs: rocBLAS unavailable");
   }
-  // Process-lifetime alpha/beta (same rationale as hipblaslt_gemm_ptrs).
-  const float* alpha_p;
-  const float* beta_p;
-  if (alpha == 1.0f && beta == 0.0f) {
-    static const float kOne = 1.0f, kZero = 0.0f;
-    alpha_p = &kOne;
-    beta_p = &kZero;
-  } else if (alpha == 1.0f && beta == 1.0f) {
-    static const float kOne = 1.0f;
-    alpha_p = &kOne;
-    beta_p = &kOne;
-  } else {
-    float* p = new float[2]{alpha, beta};
-    alpha_p = &p[0];
-    beta_p = &p[1];
-  }
+  // Host-mode scalars are read at enqueue, and launch_kernel runs its functor
+  // synchronously, so the lambda's by-value captures are valid for the call.
 
   // Row-major MLX → col-major rocBLAS: swap A/B and M/N (matches hipblaslt).
   rocblas_operation op_a = to_rocblas_op(transpose_b);
   rocblas_operation op_b = to_rocblas_op(transpose_a);
 
   encoder.launch_kernel([=, &encoder](hipStream_t stream) {
-    encoder.device().set_rocblas_stream(stream);
-    rocblas_handle handle = encoder.device().get_rocblas_handle();
+    auto lease = encoder.device().acquire_rocblas(stream);
+    rocblas_handle handle = lease.handle();
 
     if (dtype == bfloat16) {
       rocblas_status status = rocblas_gemm_ex(
@@ -344,14 +294,14 @@ void rocblas_gemm_ptrs(
           N,
           M,
           K,
-          alpha_p,
+          &alpha,
           b_ptr,
           rocblas_datatype_bf16_r,
           ldb,
           a_ptr,
           rocblas_datatype_bf16_r,
           lda,
-          beta_p,
+          &beta,
           c_ptr,
           rocblas_datatype_bf16_r,
           ldc,
@@ -404,12 +354,12 @@ void rocblas_gemm_ptrs(
           N,
           M,
           K,
-          alpha_p,
+          &alpha,
           static_cast<const float*>(b_ptr),
           ldb,
           static_cast<const float*>(a_ptr),
           lda,
-          beta_p,
+          &beta,
           static_cast<float*>(c_ptr),
           ldc);
       if (status != rocblas_status_success) {
@@ -470,8 +420,8 @@ void rocblas_gemm_batched(
   void* c_ptr = gpu_ptr<void>(c);
 
   encoder.launch_kernel([&, a_ptr, b_ptr, c_ptr](hipStream_t stream) {
-    encoder.device().set_rocblas_stream(stream);
-    rocblas_handle handle = encoder.device().get_rocblas_handle();
+    auto lease = encoder.device().acquire_rocblas(stream);
+    rocblas_handle handle = lease.handle();
 
     rocblas_operation op_a = to_rocblas_op(transpose_a);
     rocblas_operation op_b = to_rocblas_op(transpose_b);

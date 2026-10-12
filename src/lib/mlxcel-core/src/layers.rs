@@ -816,11 +816,17 @@ fn dense_gemm(
 /// Default for the fused residual-add + RMSNorm decode path.
 ///
 /// **This is the one place to flip if the measurement does not justify the
-/// fusion.** `MLXCEL_FUSED_ADD_RMSNORM=0` disables it at runtime without a
-/// rebuild; setting this constant to `false` makes off the default and
-/// `MLXCEL_FUSED_ADD_RMSNORM=1` the opt-in.
+/// fusion.** The default is per build: off on Metal and CUDA builds, on in a
+/// `rocm` build. `MLXCEL_FUSED_ADD_RMSNORM=0` disables it at runtime without a
+/// rebuild and `MLXCEL_FUSED_ADD_RMSNORM=1` enables it, on every backend.
 ///
-/// Default-OFF: measured, and the measurement did not justify wiring it on.
+/// The feature flag is the backend here, the same way PR #2098 set the ROCm
+/// `MLXCEL_FUSED_MOE_SGY` default under `MLXCEL_BRIDGE_ROCM_BACKEND`: a `rocm`
+/// build compiles no Metal or CUDA backend, so no runtime backend comparison is
+/// needed (and `scripts/ci/check_kernel_port_dispatch.py` rejects one).
+///
+/// Metal and CUDA: default-OFF. Measured, and the measurement did not justify
+/// wiring it on.
 ///
 /// Op-level microbench on Apple M1 Ultra (Metal, f16, hidden {2048, 4096,
 /// 8192} x batch {1, 4, 8}, three repetitions) put the fused path at roughly
@@ -846,29 +852,35 @@ fn dense_gemm(
 /// See `docs/benchmark_results/fused-norm-rope-m1ultra-2026-07-31.md` and
 /// `docs/benchmark_results/fused-add-rmsnorm-decode-m1ultra-2026-09-27.md`.
 ///
-/// ROCm (#2063) measured the same: with the HIP port, whose output is
-/// byte-identical to the graph, Llama 3.1 8B decode on gfx1151 was 37.85 tok/s
-/// off and 37.95 on (medians of five), and Qwen2.5 7B gained 1.5% with a size
-/// that drifted between runs as much as the off arm's spread. Not a clear win,
-/// so ROCm keeps the shared default. See
-/// `docs/benchmark_results/rocm-fused-norm-rope-gfx1151-2026-10-05.md`.
-pub(crate) const FUSED_ADD_RMSNORM_DEFAULT: bool = false;
+/// ROCm: default-ON (#2145). The HIP port (#2063, PR #2107) is byte-identical
+/// to the ROCm graph it replaces (every on/off logit-trace pair identical), and
+/// on gfx1151 it was never slower in a median: Llama 3.1 8B decode 37.85 tok/s
+/// off and 37.95 on (medians of five), Qwen2.5 7B +1.5% alone and +1.7% with
+/// the RoPE fusion. The gains sit inside run-to-run drift, but the change costs
+/// no accuracy, so the maintainer turned both fusions on for ROCm. See
+/// `docs/benchmark_results/rocm-fused-norm-rope-gfx1151-2026-10-05.md`, which
+/// also has the re-measurement of the default-on build.
+pub(crate) const FUSED_ADD_RMSNORM_DEFAULT: bool = cfg!(feature = "rocm");
 
 /// Default for the fused q/k RoPE + KV-append-layout decode path. Same
-/// flip-here contract and the same measured outcome as
-/// [`FUSED_ADD_RMSNORM_DEFAULT`], so it also ships opt-in via
-/// `MLXCEL_FUSED_ROPE_APPEND=1`.
+/// flip-here contract and the same per-build default as
+/// [`FUSED_ADD_RMSNORM_DEFAULT`]: off on Metal and CUDA (opt in with
+/// `MLXCEL_FUSED_ROPE_APPEND=1`), on in a `rocm` build (opt out with `=0`).
 ///
-/// One cell was consistently below parity rather than merely noisy: hidden
-/// 8192 at batch 1 measured 0.94x, 0.90x and 0.89x across three repetitions.
-/// That is the single reproducible signal in the sweep and it points the wrong
-/// way, which is the stronger reason to leave this unwired until a backend or
-/// shape is found where it wins.
+/// Metal: one cell was consistently below parity rather than merely noisy:
+/// hidden 8192 at batch 1 measured 0.94x, 0.90x and 0.89x across three
+/// repetitions. That is the single reproducible signal in the sweep and it
+/// points the wrong way, which is the stronger reason to leave this unwired
+/// there until a shape is found where it wins.
 ///
-/// ROCm (#2063) did not find one: on gfx1151 Qwen2.5 7B decode gained 0.6% with
-/// this kernel alone and 1.7% with both fusions (medians of seven), inside the
-/// drift between runs. Same results page as [`FUSED_ADD_RMSNORM_DEFAULT`].
-pub(crate) const FUSED_ROPE_APPEND_DEFAULT: bool = false;
+/// ROCm (#2145): the HIP port (#2063) is byte-identical to the graph, and on
+/// gfx1151 Qwen2.5 7B decode gained 0.6% with this kernel alone and 1.7% with
+/// both fusions (medians of seven), inside the drift between runs but never
+/// slower, so it is on by default with the norm fusion. Llama 3.1's
+/// `rope_scaling` frequency table still routes around it (see
+/// `report_fused_rope_bypass_once` in `src/models/llama3.rs`). Same results
+/// page as [`FUSED_ADD_RMSNORM_DEFAULT`].
+pub(crate) const FUSED_ROPE_APPEND_DEFAULT: bool = cfg!(feature = "rocm");
 
 /// Whether the fused residual-add + RMSNorm path (#905) is enabled.
 ///
@@ -880,7 +892,9 @@ pub(crate) const FUSED_ROPE_APPEND_DEFAULT: bool = false;
 /// over long generation. The two differ only by the rounding of the residual
 /// sum feeding the sum of squares (see `fused_norm.cpp`), which is far below
 /// the argmax-flip scale, but a near-tie argmax can still land on the other
-/// side. That is a tie-break difference, not a regression.
+/// side. That is a tie-break difference, not a regression. The ROCm HIP port
+/// (#2063) measured byte-identical to the ROCm graph instead: every on/off
+/// logit-trace pair in its results page matched.
 pub fn fused_add_rmsnorm_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -906,13 +920,22 @@ pub fn fused_rope_append_enabled() -> bool {
 /// value takes `default` rather than silently disabling: a typo in a deployment
 /// script should not quietly change the decode graph.
 fn fused_flag_enabled_from(value: Option<&str>, default: bool) -> bool {
-    match value {
-        Some(v) => match v.trim().to_ascii_lowercase().as_str() {
-            "0" | "false" | "off" | "no" => false,
-            "1" | "true" | "on" | "yes" => true,
-            _ => default,
-        },
-        None => default,
+    fused_flag_explicit_value(value).unwrap_or(default)
+}
+
+/// The explicit setting a #905 kill-switch value spells, if any: `Some(false)`
+/// for `0`/`false`/`off`/`no`, `Some(true)` for `1`/`true`/`on`/`yes`
+/// (case-insensitive, trimmed), and `None` when the variable is unset or the
+/// value is unrecognised, which is when the compiled-in default applies.
+///
+/// Public so a caller can tell "the user asked for this" apart from "the build
+/// defaults to this": the Llama 3.1 RoPE bypass notice (#2145) must fire only
+/// for the former, now that the ROCm default is on.
+pub fn fused_flag_explicit_value(value: Option<&str>) -> Option<bool> {
+    match value?.trim().to_ascii_lowercase().as_str() {
+        "0" | "false" | "off" | "no" => Some(false),
+        "1" | "true" | "on" | "yes" => Some(true),
+        _ => None,
     }
 }
 
@@ -5326,173 +5349,6 @@ pub unsafe fn attention_from_ptr(
     attention(q, k, v, scale, mask, softcap, window_size)
 }
 
-fn validate_paged_decode_inputs(
-    q: &MlxArray,
-    cache_keys: &[*const MlxArray],
-    cache_values: &[*const MlxArray],
-    metadata: &crate::cache::PagedDecodeMetadata,
-) -> Result<(), String> {
-    let q_shape = ffi::array_shape(q);
-    if q_shape.len() != 4 {
-        return Err(format!(
-            "paged decode attention expected q rank 4, got shape {:?}",
-            q_shape
-        ));
-    }
-    if q_shape[2] != 1 {
-        return Err(format!(
-            "paged decode attention only supports decode-only q_len == 1, got {}",
-            q_shape[2]
-        ));
-    }
-
-    let batch = q_shape[0].max(0) as usize;
-    if cache_keys.len() != batch || cache_values.len() != batch {
-        return Err(format!(
-            "paged decode attention expected {} cache pointers, got {} keys and {} values",
-            batch,
-            cache_keys.len(),
-            cache_values.len()
-        ));
-    }
-    if cache_keys.iter().any(|ptr| ptr.is_null()) || cache_values.iter().any(|ptr| ptr.is_null()) {
-        return Err(
-            "paged decode attention received a null dense compatibility cache pointer".to_string(),
-        );
-    }
-    if metadata.len() != batch {
-        return Err(format!(
-            "paged decode attention expected {} metadata entries, got {}",
-            batch,
-            metadata.len()
-        ));
-    }
-    if metadata.block_table_offsets.len() != batch + 1 {
-        return Err(format!(
-            "paged decode attention expected {} block offsets, got {}",
-            batch + 1,
-            metadata.block_table_offsets.len()
-        ));
-    }
-    if metadata
-        .block_table_offsets
-        .last()
-        .copied()
-        .unwrap_or_default() as usize
-        != metadata.block_tables.len()
-    {
-        return Err(
-            "paged decode attention block table offsets do not cover the flattened block table"
-                .to_string(),
-        );
-    }
-
-    Ok(())
-}
-
-/// Reference paged decode path over dense compatibility KV caches.
-///
-/// This stays entirely in Rust/FFI wrappers and is primarily used as a
-/// correctness baseline and benchmark fallback for the native paged decode
-/// kernel.
-pub fn paged_decode_attention_dense_fallback(
-    q: &MlxArray,
-    cache_keys: &[*const MlxArray],
-    cache_values: &[*const MlxArray],
-    metadata: &crate::cache::PagedDecodeMetadata,
-    scale: f32,
-) -> Result<UniquePtr<MlxArray>, String> {
-    validate_paged_decode_inputs(q, cache_keys, cache_values, metadata)?;
-
-    let q_shape = ffi::array_shape(q);
-    let batch = q_shape[0].max(0) as usize;
-    let mut outputs: Vec<UniquePtr<MlxArray>> = Vec::with_capacity(batch);
-
-    for batch_idx in 0..batch {
-        let kv_len = metadata.kv_lens[batch_idx];
-        if kv_len <= 0 {
-            return Err(format!(
-                "paged decode fallback requires kv_len > 0 for batch index {batch_idx}, got {kv_len}"
-            ));
-        }
-
-        let q_i = ffi::slice(
-            q,
-            &[batch_idx as i32, 0, 0, 0],
-            &[batch_idx as i32 + 1, i32::MAX, 1, i32::MAX],
-        );
-
-        let table_begin = metadata.block_table_offsets[batch_idx] as usize;
-        let table_end = metadata.block_table_offsets[batch_idx + 1] as usize;
-        let key_cache = unsafe { &*cache_keys[batch_idx] };
-        let value_cache = unsafe { &*cache_values[batch_idx] };
-
-        let mut key_visible: Option<UniquePtr<MlxArray>> = None;
-        let mut value_visible: Option<UniquePtr<MlxArray>> = None;
-
-        for &logical_block in &metadata.block_tables[table_begin..table_end] {
-            let block_start = logical_block * metadata.block_size;
-            if block_start >= kv_len {
-                continue;
-            }
-            let block_end = (block_start + metadata.block_size).min(kv_len);
-
-            let key_block = ffi::slice(
-                key_cache,
-                &[0, 0, block_start, 0],
-                &[1, i32::MAX, block_end, i32::MAX],
-            );
-            let value_block = ffi::slice(
-                value_cache,
-                &[0, 0, block_start, 0],
-                &[1, i32::MAX, block_end, i32::MAX],
-            );
-
-            key_visible = Some(match key_visible {
-                Some(prev) => crate::concatenate(&prev, &key_block, 2),
-                None => key_block,
-            });
-            value_visible = Some(match value_visible {
-                Some(prev) => crate::concatenate(&prev, &value_block, 2),
-                None => value_block,
-            });
-        }
-
-        let key_visible = key_visible.ok_or_else(|| {
-            format!("paged decode fallback built no visible key blocks for batch index {batch_idx}")
-        })?;
-        let value_visible = value_visible.ok_or_else(|| {
-            format!(
-                "paged decode fallback built no visible value blocks for batch index {batch_idx}"
-            )
-        })?;
-
-        outputs.push(unsafe {
-            attention_from_ptr(
-                &q_i,
-                &key_visible,
-                &value_visible,
-                scale,
-                std::ptr::null(),
-                0.0,
-                0,
-            )
-        });
-    }
-
-    // `drain(..1)` panics on an empty vec, so reject `batch == 0` explicitly
-    // with a clean error instead (issue #195).
-    if outputs.is_empty() {
-        return Err("paged decode fallback received an empty batch (batch == 0)".to_string());
-    }
-    let mut outputs = outputs.into_iter();
-    let mut result = outputs.next().expect("outputs is non-empty: checked above");
-    for output in outputs {
-        result = crate::concatenate(&result, &output, 0);
-    }
-    Ok(result)
-}
-
 fn validate_pooled_paged_decode_inputs(
     q: &MlxArray,
     states: &[&crate::cache::PagedSequenceState],
@@ -5525,14 +5381,10 @@ fn validate_pooled_paged_decode_inputs(
 /// Reference paged decode path that gathers K/V from the [`PagedBlockPool`].
 ///
 /// This is the Phase 2 (#119) pooled read path of the unified paged KV cache
-/// (epic #116). It is the pooled analogue of [`paged_decode_attention_dense_fallback`],
-/// which stays the live decode path and the parity baseline this function is
-/// validated against. The two differ only in where the per-sequence visible
-/// K/V comes from: the dense fallback slices contiguous dense compatibility
-/// buffers, while this function calls [`crate::cache::PagedBlockPool::gather_visible`]
-/// to pull each sequence's physical blocks out of the pool by block-table order.
-/// Everything downstream — the per-batch `q` slice, the fused SDPA dispatch via
-/// [`attention_from_ptr`], and the axis-0 batch concat — is identical.
+/// (epic #116). It calls [`crate::cache::PagedBlockPool::gather_visible`] to
+/// pull each sequence's physical blocks out of the pool by block-table order,
+/// then runs the per-batch `q` slice through fused SDPA and concatenates the
+/// row outputs on axis 0.
 ///
 /// Per ADR 0001 (`docs/adr/0001-paged-attention-gather-vs-fused-kernel.md`) this
 /// is strategy option A, *gather-then-SDPA*: `gather_visible` builds a
@@ -5551,8 +5403,7 @@ fn validate_pooled_paged_decode_inputs(
 /// `trim_tokens` advances as the window slides), so `gather_visible` returns
 /// exactly the `[logical_start, len)` window already shaped
 /// `[1, n_kv_heads, visible_len, head_dim]` (SDPA-ready). That is why there is
-/// no separate "rotating" pooled variant mirroring
-/// [`paged_decode_attention_rotating_fallback`].
+/// no separate rotating pooled variant for ring-buffer cache storage.
 ///
 /// `gather_visible` returning `Ok(None)` (no visible tokens, or the layer has no
 /// pool storage yet) is treated as an error here, because decode requires a
@@ -5740,8 +5591,9 @@ pub fn select_pooled_paged_dispatch(
 ///   values (`0` / `false` / `off` / `no`) as its kill switch: setting it
 ///   restores the pre-#899 gather-then-SDPA behaviour end to end.
 ///
-/// The separate `DecodeBatchContext::use_native_paged_kernel` request still
-/// governs the *dense-compat* block-table decode, which is a different path.
+/// Model-owned families are not governed by it: since #2172 they attend
+/// directly through their dense cache implementations (ADR 0009), without a
+/// pooled or block-table decode route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NativePagedOverride {
     /// Force the fused kernel, bypassing the adaptive selector (the original
@@ -5994,10 +5846,8 @@ fn resolve_pooled_paged_dispatch(
 /// entry point to a library API (ADR 0001, resolving issue #710). The in-server
 /// decode routes pool-backed layers through the per-sequence `update_and_fetch`
 /// pool intercept (gather + standard SDPA, `src/models/llama3.rs`
-/// `is_paged_backed()`), and production models call
-/// [`paged_decode_attention_dense_compat`] / [`paged_decode_attention_dense_fallback`],
-/// never this function. It is kept and tested for external mlxcel-core consumers
-/// and `examples/paged_attention_kernel_bench.rs`. ADR 0001 records the
+/// `is_paged_backed()`). It is kept and tested for external mlxcel-core
+/// consumers and `examples/paged_attention_kernel_bench.rs`. ADR 0001 records the
 /// occupancy derivation: the selector's single-slab batched island (`B>=4`, at
 /// most ~256 tokens per sequence at `block_size` 32) is unreachable under the
 /// shipped serving defaults and transient even when entered, so a scheduler
@@ -6036,246 +5886,6 @@ pub fn paged_decode_attention_pooled(
         return Ok(out);
     }
     paged_decode_attention_pooled_fallback(q, pool, states, layer_idx, scale)
-}
-
-/// Native paged decode path over dense compatibility KV caches.
-///
-/// The C++ bridge consumes the logical block table metadata and performs the
-/// per-sequence block gathering plus SDPA dispatch natively, reducing Rust-side
-/// FFI churn on the decode hot path.
-pub fn paged_decode_attention_dense_compat(
-    q: &MlxArray,
-    cache_keys: &[*const MlxArray],
-    cache_values: &[*const MlxArray],
-    metadata: &crate::cache::PagedDecodeMetadata,
-    scale: f32,
-) -> Result<UniquePtr<MlxArray>, String> {
-    validate_paged_decode_inputs(q, cache_keys, cache_values, metadata)?;
-    Ok(unsafe {
-        ffi::paged_decode_attention_dense_compat(
-            q,
-            cache_keys,
-            cache_values,
-            &metadata.kv_lens,
-            &metadata.block_tables,
-            &metadata.block_table_offsets,
-            metadata.block_size,
-            scale,
-        )
-    })
-}
-
-fn validate_rotating_paged_decode_inputs(
-    q: &MlxArray,
-    cache_keys: &[*const MlxArray],
-    cache_values: &[*const MlxArray],
-    metadata: &crate::cache::RotatingPagedDecodeMetadata,
-) -> Result<(), String> {
-    let q_shape = ffi::array_shape(q);
-    if q_shape.len() != 4 {
-        return Err(format!(
-            "rotating paged decode attention expected q rank 4, got shape {:?}",
-            q_shape
-        ));
-    }
-    if q_shape[2] != 1 {
-        return Err(format!(
-            "rotating paged decode attention only supports decode-only q_len == 1, got {}",
-            q_shape[2]
-        ));
-    }
-
-    let batch = q_shape[0].max(0) as usize;
-    if cache_keys.len() != batch || cache_values.len() != batch {
-        return Err(format!(
-            "rotating paged decode attention expected {} cache pointers, got {} keys and {} values",
-            batch,
-            cache_keys.len(),
-            cache_values.len()
-        ));
-    }
-    if cache_keys.iter().any(|ptr| ptr.is_null()) || cache_values.iter().any(|ptr| ptr.is_null()) {
-        return Err(
-            "rotating paged decode attention received a null ring-buffer cache pointer".to_string(),
-        );
-    }
-    if metadata.len() != batch {
-        return Err(format!(
-            "rotating paged decode attention expected {} metadata entries, got {}",
-            batch,
-            metadata.len()
-        ));
-    }
-    Ok(())
-}
-
-/// Reference paged decode path over rotating ring-buffer KV caches.
-pub fn paged_decode_attention_rotating_fallback(
-    q: &MlxArray,
-    cache_keys: &[*const MlxArray],
-    cache_values: &[*const MlxArray],
-    metadata: &crate::cache::RotatingPagedDecodeMetadata,
-    scale: f32,
-) -> Result<UniquePtr<MlxArray>, String> {
-    validate_rotating_paged_decode_inputs(q, cache_keys, cache_values, metadata)?;
-
-    let q_shape = ffi::array_shape(q);
-    let batch = q_shape[0].max(0) as usize;
-    let mut outputs: Vec<UniquePtr<MlxArray>> = Vec::with_capacity(batch);
-
-    for batch_idx in 0..batch {
-        let kv_len = metadata.kv_lens[batch_idx];
-        let logical_start = metadata.logical_starts[batch_idx];
-        if kv_len <= 0 {
-            return Err(format!(
-                "rotating paged decode fallback requires kv_len > 0 for batch index {batch_idx}, got {kv_len}"
-            ));
-        }
-
-        let q_i = ffi::slice(
-            q,
-            &[batch_idx as i32, 0, 0, 0],
-            &[batch_idx as i32 + 1, i32::MAX, 1, i32::MAX],
-        );
-
-        let key_cache = unsafe { &*cache_keys[batch_idx] };
-        let value_cache = unsafe { &*cache_values[batch_idx] };
-        let buffer_len = ffi::array_shape(key_cache)
-            .get(2)
-            .copied()
-            .unwrap_or_default();
-        if buffer_len <= 0 {
-            return Err(format!(
-                "rotating paged decode fallback requires non-empty buffer for batch index {batch_idx}"
-            ));
-        }
-        if logical_start < 0 || logical_start >= buffer_len {
-            return Err(format!(
-                "rotating paged decode fallback received invalid logical_start={logical_start} for buffer_len={buffer_len}"
-            ));
-        }
-
-        let block_count = (kv_len + metadata.block_size - 1) / metadata.block_size;
-        let mut key_visible: Option<UniquePtr<MlxArray>> = None;
-        let mut value_visible: Option<UniquePtr<MlxArray>> = None;
-        for logical_block in 0..block_count {
-            let logical_pos = logical_block * metadata.block_size;
-            let logical_end = (logical_pos + metadata.block_size).min(kv_len);
-            let token_count = logical_end - logical_pos;
-            if token_count <= 0 {
-                continue;
-            }
-
-            let physical_start = (logical_start + logical_pos).rem_euclid(buffer_len);
-            let physical_end = physical_start + token_count;
-            let key_block = if physical_end <= buffer_len {
-                ffi::slice(
-                    key_cache,
-                    &[0, 0, physical_start, 0],
-                    &[1, i32::MAX, physical_end, i32::MAX],
-                )
-            } else {
-                let key_tail = ffi::slice(
-                    key_cache,
-                    &[0, 0, physical_start, 0],
-                    &[1, i32::MAX, buffer_len, i32::MAX],
-                );
-                let key_head = ffi::slice(
-                    key_cache,
-                    &[0, 0, 0, 0],
-                    &[1, i32::MAX, physical_end - buffer_len, i32::MAX],
-                );
-                crate::concatenate(&key_tail, &key_head, 2)
-            };
-            let value_block = if physical_end <= buffer_len {
-                ffi::slice(
-                    value_cache,
-                    &[0, 0, physical_start, 0],
-                    &[1, i32::MAX, physical_end, i32::MAX],
-                )
-            } else {
-                let value_tail = ffi::slice(
-                    value_cache,
-                    &[0, 0, physical_start, 0],
-                    &[1, i32::MAX, buffer_len, i32::MAX],
-                );
-                let value_head = ffi::slice(
-                    value_cache,
-                    &[0, 0, 0, 0],
-                    &[1, i32::MAX, physical_end - buffer_len, i32::MAX],
-                );
-                crate::concatenate(&value_tail, &value_head, 2)
-            };
-
-            key_visible = Some(match key_visible {
-                Some(prev) => crate::concatenate(&prev, &key_block, 2),
-                None => key_block,
-            });
-            value_visible = Some(match value_visible {
-                Some(prev) => crate::concatenate(&prev, &value_block, 2),
-                None => value_block,
-            });
-        }
-
-        let key_visible = key_visible.ok_or_else(|| {
-            format!(
-                "rotating paged decode fallback built no visible key blocks for batch index {batch_idx}"
-            )
-        })?;
-        let value_visible = value_visible.ok_or_else(|| {
-            format!(
-                "rotating paged decode fallback built no visible value blocks for batch index {batch_idx}"
-            )
-        })?;
-
-        outputs.push(unsafe {
-            attention_from_ptr(
-                &q_i,
-                &key_visible,
-                &value_visible,
-                scale,
-                std::ptr::null(),
-                0.0,
-                0,
-            )
-        });
-    }
-
-    // `drain(..1)` panics on an empty vec, so reject `batch == 0` explicitly
-    // with a clean error instead (issue #195).
-    if outputs.is_empty() {
-        return Err(
-            "rotating paged decode fallback received an empty batch (batch == 0)".to_string(),
-        );
-    }
-    let mut outputs = outputs.into_iter();
-    let mut result = outputs.next().expect("outputs is non-empty: checked above");
-    for output in outputs {
-        result = crate::concatenate(&result, &output, 0);
-    }
-    Ok(result)
-}
-
-/// Native paged decode path over rotating ring-buffer KV caches.
-pub fn paged_decode_attention_rotating_compat(
-    q: &MlxArray,
-    cache_keys: &[*const MlxArray],
-    cache_values: &[*const MlxArray],
-    metadata: &crate::cache::RotatingPagedDecodeMetadata,
-    scale: f32,
-) -> Result<UniquePtr<MlxArray>, String> {
-    validate_rotating_paged_decode_inputs(q, cache_keys, cache_values, metadata)?;
-    Ok(unsafe {
-        ffi::paged_decode_attention_rotating_compat(
-            q,
-            cache_keys,
-            cache_values,
-            &metadata.kv_lens,
-            &metadata.logical_starts,
-            metadata.block_size,
-            scale,
-        )
-    })
 }
 
 /// Metal 4 fused attention dispatch with automatic hardware detection.
@@ -9380,11 +8990,50 @@ mod tests {
         }
     }
 
-    /// The #905 kill switches are default-ON, which is the inverse of the
-    /// opt-in `MLXCEL_FUSED_QK_NORM` flag above, so they get their own pin: a
-    /// recognised disable string turns the fusion off, an unset variable leaves
-    /// the compiled-in default, and an unrecognised value must not silently
-    /// change the decode graph.
+    #[test]
+    fn fused_905_defaults_are_on_for_rocm_builds_only() {
+        // #2145: a `rocm` build turns both fusions on by default; Metal and CUDA
+        // builds keep them off. Pinned against the feature rather than a
+        // literal so each backend's build checks its own default.
+        assert_eq!(FUSED_ADD_RMSNORM_DEFAULT, cfg!(feature = "rocm"));
+        assert_eq!(FUSED_ROPE_APPEND_DEFAULT, cfg!(feature = "rocm"));
+        #[cfg(feature = "rocm")]
+        {
+            assert!(fused_add_rmsnorm_enabled_from(None));
+            assert!(fused_rope_append_enabled_from(None));
+            // The kill switch still turns them off on ROCm.
+            assert!(!fused_add_rmsnorm_enabled_from(Some("0")));
+            assert!(!fused_rope_append_enabled_from(Some("0")));
+        }
+        #[cfg(not(feature = "rocm"))]
+        {
+            assert!(!fused_add_rmsnorm_enabled_from(None));
+            assert!(!fused_rope_append_enabled_from(None));
+            // And `=1` still opts in elsewhere.
+            assert!(fused_add_rmsnorm_enabled_from(Some("1")));
+            assert!(fused_rope_append_enabled_from(Some("1")));
+        }
+    }
+
+    #[test]
+    fn fused_flag_explicit_value_separates_a_setting_from_the_default() {
+        assert_eq!(fused_flag_explicit_value(None), None);
+        for v in ["", "maybe", "2"] {
+            assert_eq!(fused_flag_explicit_value(Some(v)), None, "{v:?}");
+        }
+        for v in ["0", "false", "off", "no", " OFF "] {
+            assert_eq!(fused_flag_explicit_value(Some(v)), Some(false), "{v:?}");
+        }
+        for v in ["1", "true", "on", "yes", " Yes "] {
+            assert_eq!(fused_flag_explicit_value(Some(v)), Some(true), "{v:?}");
+        }
+    }
+
+    /// The #905 kill switches default per build (on for `rocm`, off elsewhere),
+    /// unlike the always-opt-in `MLXCEL_FUSED_QK_NORM` flag above, so they get
+    /// their own pin: a recognised disable string turns the fusion off, an
+    /// unset variable leaves the compiled-in default, and an unrecognised value
+    /// must not silently change the decode graph.
     #[test]
     fn fused_905_flags_follow_the_default_and_respect_explicit_values() {
         // Unset means the compiled-in default, whichever way it is set. Asserting
@@ -9923,13 +9572,13 @@ mod residual_add3_layer_norm_tests {
             );
             return;
         }
-        if matches!(
-            gpu_backend_kind(),
-            GpuBackendKind::Metal | GpuBackendKind::Rocm
-        ) {
+        // ROCm's port is wave32-only and held back on a wave64 device (#2147).
+        if gpu_backend_kind() == GpuBackendKind::Metal
+            || (gpu_backend_kind() == GpuBackendKind::Rocm && ffi::rocm_device_warp_size() == 32)
+        {
             assert!(
                 ffi::fused_add3_layer_norm_available(),
-                "Metal and ROCm have a fused add3 + LayerNorm port"
+                "Metal and wave32 ROCm have a fused add3 + LayerNorm port"
             );
         }
         for (dt, dim, rows, with_bias) in [
