@@ -52,14 +52,42 @@ use super::chat_template_kwargs::ChatTemplateKwargs;
 use super::tool_calls::{self, ToolCallFormat};
 use super::types::request::Tool;
 
-#[path = "chat_template_content.rs"]
-mod content;
-
 /// A message in the conversation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+}
+
+/// Borrowed serialization shape for templates that require typed text parts.
+///
+/// The explicit, exhaustive destructuring in [`From`] makes adding a field to
+/// [`ChatMessage`] a compile error here until that field is preserved in this
+/// rendering shape as well.
+#[derive(Serialize)]
+struct TypedTextChatMessage<'a> {
+    role: &'a str,
+    content: [TypedTextContentPart<'a>; 1],
+}
+
+#[derive(Serialize)]
+struct TypedTextContentPart<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: &'a str,
+}
+
+impl<'a> From<&'a ChatMessage> for TypedTextChatMessage<'a> {
+    fn from(message: &'a ChatMessage) -> Self {
+        let ChatMessage { role, content } = message;
+        Self {
+            role,
+            content: [TypedTextContentPart {
+                kind: "text",
+                text: content,
+            }],
+        }
+    }
 }
 
 /// Sentinel attached as the [`std::error::Error::source`] of every error a
@@ -181,10 +209,12 @@ pub struct ChatTemplateProcessor {
     bos_token: String,
     eos_token: String,
     add_generation_prompt: bool,
-    /// Checkpoint templates may need typed text parts. Decisions use the
-    /// effective render context and string-content roles, with a bounded cache.
-    /// Custom template strings keep their caller-controlled content contract.
-    content_normalizer: Option<content::ContentNormalizer>,
+    /// Whether typed [`ChatMessage`] renders must express text as content parts.
+    ///
+    /// Some multimodal checkpoint templates silently drop a plain string even
+    /// though they render an equivalent typed text part.  This is detected once
+    /// while loading the checkpoint and never changes the raw JSON contract.
+    wrap_string_content: bool,
     /// Cached result of `supports_tools()` introspection.
     /// `None` means not yet computed.
     supports_tools_cached: Option<bool>,
@@ -325,10 +355,7 @@ impl std::fmt::Display for ChatTemplateCompileError {
 impl std::error::Error for ChatTemplateCompileError {}
 
 impl ChatTemplateProcessor {
-    /// Create a new processor by loading template from tokenizer_config.json or chat_template.jinja.
-    ///
-    /// Used by: CLI and server model loading across families, including
-    /// Granite Vision, Llama and Qwen.
+    /// Create a new processor by loading template from tokenizer_config.json or chat_template.jinja
     pub fn from_model_path(model_path: &Path) -> Result<Option<Self>> {
         let config_path = model_path.join("tokenizer_config.json");
         let config: Option<serde_json::Value> = if config_path.exists() {
@@ -416,13 +443,13 @@ impl ChatTemplateProcessor {
 
         let template = preprocess_template(template);
         let forced_tool_call_format = detect_forced_tool_call_format(&template);
-        Ok(Some(Self {
+        let mut processor = Self {
             template,
             compiled_template: Arc::new(OnceLock::new()),
             bos_token,
             eos_token,
             add_generation_prompt: true,
-            content_normalizer: Some(content::ContentNormalizer::default()),
+            wrap_string_content: false,
             supports_tools_cached: None,
             forced_tool_call_format,
             default_enable_thinking: false,
@@ -431,7 +458,9 @@ impl ChatTemplateProcessor {
             kimi_k3_family_unrenderable: false,
             #[cfg(test)]
             template_compile_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        }))
+        };
+        processor.wrap_string_content = template_requires_typed_text_content(&processor);
+        Ok(Some(processor))
     }
 
     /// Create a processor with a custom template string
@@ -444,7 +473,7 @@ impl ChatTemplateProcessor {
             bos_token: String::new(),
             eos_token: String::new(),
             add_generation_prompt: true,
-            content_normalizer: None,
+            wrap_string_content: false,
             supports_tools_cached: None,
             forced_tool_call_format,
             default_enable_thinking: false,
@@ -927,11 +956,6 @@ impl ChatTemplateProcessor {
     /// `[{"type": "image"}, {"type": "text", "text": "..."}]`) that Jinja2
     /// templates like Gemma3 VLM can iterate over.
     ///
-    /// Checkpoint-loaded processors conservatively adapt eligible string
-    /// content to typed text parts in the effective render context. Existing
-    /// arrays, null content and message metadata are untouched. Processors
-    /// created with with_template retain the caller's original raw contract.
-    ///
     /// When `tools` is `Some`, the tool definitions are passed to the Jinja2
     /// template context, enabling tool-calling prompt formatting.
     ///
@@ -956,12 +980,11 @@ impl ChatTemplateProcessor {
     /// plumbing path used's `preserve_thinking` feature and
     /// generalizes to any future kwarg a HuggingFace chat template expects.
     ///
-    /// Canonical server keys (messages, bos_token, eos_token,
-    /// add_generation_prompt and tools) are reserved; attempts to override
-    /// them through kwargs are ignored. enable_thinking remains overridable.
-    /// Other kwargs enter the effective context used for both adaptation and
-    /// rendering.
-    // Used by: chat_request, routes/chat, checkpoint-backed prompt inspection
+    /// When a kwarg key duplicates an already-provided context entry
+    /// (`messages`, `bos_token`, `eos_token`, `add_generation_prompt`,
+    /// `tools`), the kwarg value wins — this lets operators override defaults
+    /// if a template ships with unusual expectations.
+    // Used by: chat_request, routes/chat
     pub fn apply_raw_with_kwargs(
         &self,
         messages: &serde_json::Value,
@@ -999,6 +1022,9 @@ impl ChatTemplateProcessor {
         kwargs: &ChatTemplateKwargs,
         add_generation_prompt: bool,
     ) -> Result<String> {
+        // Convert serde_json::Value to minijinja::Value
+        let messages_val = minijinja::Value::from_serialize(messages);
+
         // Leave `tools` UNDEFINED when the request carries no tools, and count
         // an explicit empty list as no tools (issue #1597). Three guard shapes
         // ship in the local template corpus and only an absent key satisfies
@@ -1029,7 +1055,7 @@ impl ChatTemplateProcessor {
             .map(minijinja::Value::from_serialize);
 
         let context = build_template_context(
-            Value::UNDEFINED,
+            messages_val,
             &self.bos_token,
             &self.eos_token,
             add_generation_prompt,
@@ -1040,16 +1066,11 @@ impl ChatTemplateProcessor {
             self.thinking_mode_sentinel().as_deref(),
         );
 
-        // Both ordinary and raw messages use this one adaptation boundary.
-        // Probes call the unchecked renderer, so they cannot normalize again.
-        // Existing arrays, null content and message metadata remain untouched.
-        let messages = match &self.content_normalizer {
-            Some(normalizer) => {
-                normalizer.normalize(messages, &context, |probe| self.render_template(probe))
-            }
-            None => std::borrow::Cow::Borrowed(messages),
-        };
-        let rendered = self.render_template(content::with_messages(&context, messages.as_ref()))?;
+        // Render directly: minijinja reproduces the template's own
+        // enable_thinking branches faithfully (issue #686), so no post-render
+        // Gemma-4 patching is applied. The `enable_thinking` value reaches the
+        // template through `build_template_context` above.
+        let rendered = self.render_template(context)?;
         Ok(self.complete_generation_prompt(rendered, add_generation_prompt))
     }
 
@@ -1095,8 +1116,6 @@ impl ChatTemplateProcessor {
         self.apply_inner(messages, tools, kwargs, false)
     }
 
-    // Used by: text-only CLI and server generation/history renders across
-    // model families. Share adaptation, kwargs and rendering with the raw path.
     fn apply_inner(
         &self,
         messages: &[ChatMessage],
@@ -1104,9 +1123,43 @@ impl ChatTemplateProcessor {
         kwargs: &ChatTemplateKwargs,
         add_generation_prompt: bool,
     ) -> Result<String> {
-        let messages =
-            serde_json::to_value(messages).context("Failed to serialize chat messages")?;
-        self.apply_raw_inner(&messages, tools, kwargs, add_generation_prompt)
+        // Same `tools` rule as `apply_raw_inner`: the key is absent when the
+        // request carries no tools, and an explicit empty list counts as no
+        // tools (issue #1597). See that function for why undefined rather than
+        // `none` or an empty list is the value that every shipped guard shape
+        // agrees on.
+        let tools_val = tools
+            .filter(|t| !t.is_empty())
+            .map(minijinja::Value::from_serialize);
+
+        let wrapped_messages = self.wrap_string_content.then(|| {
+            messages
+                .iter()
+                .map(TypedTextChatMessage::from)
+                .collect::<Vec<_>>()
+        });
+        let messages_val = match wrapped_messages.as_ref() {
+            Some(messages) => minijinja::Value::from_serialize(messages),
+            None => minijinja::Value::from_serialize(messages),
+        };
+        let context = build_template_context(
+            messages_val,
+            &self.bos_token,
+            &self.eos_token,
+            add_generation_prompt,
+            tools_val,
+            kwargs,
+            self.default_enable_thinking,
+            self.wants_bare_thinking_alias(),
+            self.thinking_mode_sentinel().as_deref(),
+        );
+
+        // Render directly: minijinja reproduces the template's own
+        // enable_thinking branches faithfully (issue #686), so no post-render
+        // Gemma-4 patching is applied. The `enable_thinking` value reaches the
+        // template through `build_template_context` above.
+        let rendered = self.render_template(context)?;
+        Ok(self.complete_generation_prompt(rendered, add_generation_prompt))
     }
 }
 
@@ -1468,6 +1521,34 @@ fn template_renders_typed_image_content(template: &str) -> bool {
             with_image.contains("__mlxcel_text_probe__")
                 && text_only.contains("__mlxcel_text_probe__")
                 && with_image != text_only
+        }
+        _ => false,
+    }
+}
+
+const TEXT_CONTENT_PROBE_MARKER: &str = "__mlxcel_text_probe__";
+
+/// Detect a checkpoint template that accepts typed text parts but drops strings.
+///
+/// Both probes go through the raw renderer so this decision cannot observe or
+/// recursively trigger the typed-message adaptation it controls.  Any render
+/// error is treated conservatively as no adaptation.
+fn template_requires_typed_text_content(processor: &ChatTemplateProcessor) -> bool {
+    let string_content = serde_json::json!([{
+        "role": "user",
+        "content": TEXT_CONTENT_PROBE_MARKER,
+    }]);
+    let typed_content = serde_json::json!([{
+        "role": "user",
+        "content": [{"type": "text", "text": TEXT_CONTENT_PROBE_MARKER}],
+    }]);
+    match (
+        processor.apply_raw(&string_content, None),
+        processor.apply_raw(&typed_content, None),
+    ) {
+        (Ok(string_render), Ok(typed_render)) => {
+            !string_render.contains(TEXT_CONTENT_PROBE_MARKER)
+                && typed_render.contains(TEXT_CONTENT_PROBE_MARKER)
         }
         _ => false,
     }
@@ -5035,13 +5116,5 @@ TOOL
 }
 
 #[cfg(test)]
-#[path = "chat_template_content_tests.rs"]
-mod content_tests;
-
-#[cfg(test)]
-#[path = "chat_template_raw_content_tests.rs"]
-mod raw_content_tests;
-
-#[cfg(test)]
-#[path = "chat_template_policy_tests.rs"]
-mod policy_tests;
+#[path = "chat_template_text_wrap_tests.rs"]
+mod text_wrap_tests;
