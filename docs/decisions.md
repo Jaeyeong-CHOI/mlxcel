@@ -2,7 +2,7 @@
 
 A decision model answers named questions about a state with calibrated probabilities instead of generated text: route a ticket to `billing`, rate a screenshot from `low` to `high`, say whether a transcript asks for a refund. mlxcel serves them through `POST /v1/decisions`, the `--decision-model` server flag, and the offline `mlxcel decide` command. The contract is mlx-vlm's shared decision API ([`decision.py`](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/decision.py), [`decide.py`](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/decide.py), [`server/decisions.py`](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/server/decisions.py)), including its validation messages, so a client written against mlx-vlm sees the same responses.
 
-**Current status.** The API surface (request validation, the worker, the route, the server flag, the CLI) is implemented. Three families are ported, LiquidAI d1-3B (#2367), Decider-2b (#2359) and Clef (#2365), see [Supported decision models](#supported-decision-models). A checkpoint no family recognizes is refused with `<path> is not a decision checkpoint`.
+**Current status.** The API surface (request validation, the worker, the route, the server flag, the CLI) is implemented. Four families are ported, LiquidAI d1-3B (#2367), Decider-2b (#2359), Clef (#2365) and Laya (#2363), see [Supported decision models](#supported-decision-models). A checkpoint no family recognizes is refused with `<path> is not a decision checkpoint`.
 
 ## Supported decision models
 
@@ -11,6 +11,7 @@ A decision model answers named questions about a state with calibrated probabili
 | LiquidAI d1 | `model_type` `lfm2_vl` (or `lfm2-vl`) with `auto_map.AutoModel` ending in `D1Model` | [`LiquidAI/d1-3B`](https://huggingface.co/LiquidAI/d1-3B), [`LiquidAI/d1-3B-MLX-8bit`](https://huggingface.co/LiquidAI/d1-3B-MLX-8bit) (validated), `-MLX-4bit`, `-MLX-fp16` | `choice`, `score` (2 to 10 levels), `bool` (`noul`) | `images` |
 | Decider-2b | `model_type` `decider2` | [`nativ-community/decider-2b`](https://huggingface.co/nativ-community/decider-2b) (bf16, validated) | `choice` (2 to 255 options), `score` (2 to 10 levels), `bool` (`noul`) | none |
 | Clef, Clef-Flash | `model_type` `clef` | [`nativ-community/clef-flash-MLX-8bit`](https://huggingface.co/nativ-community/clef-flash-MLX-8bit) (validated), [`nativ-community/clef-MLX-8bit`](https://huggingface.co/nativ-community/clef-MLX-8bit) (loads and answers; not parity-tested); the `-MLX-NVFP4` / `-MLX-MXFP4` builds load through the same path but were not run | `choice`, `score`, `bool` (`noul`) | `images`, `videos` |
+| Laya | `model_type` `laya` | [`nativ-community/laya`](https://huggingface.co/nativ-community/laya) (f16, validated) | `choice`, `score`, `bool` (`noul`) | none |
 
 ### LiquidAI d1-3B
 
@@ -52,6 +53,20 @@ mlxcel decide -m nativ-community/clef-flash-MLX-8bit --state "Please refund my d
   --questions '{"department": {"type": "choice", "instructions": "Which team should handle this ticket?", "criteria": ["billing", "technical", "sales"]}}'
 mlxcel decide -m nativ-community/clef-flash-MLX-8bit --video clip.mp4 \
   --questions '{"moving": {"type": "bool", "instructions": "Does anything move in the clip?"}}'
+```
+
+### Laya
+
+Laya (`src/decision/laya.rs`) is a ModernBERT-large encoder with a two-layer decision head that scores one marker token per option, ported from mlx-vlm's [`models/laya`](https://github.com/Blaizzy/mlx-vlm/tree/main/mlx_vlm/models/laya). The encoder (`encoder.*`) loads through the ModernBERT stack, with `encoder_config.rope_parameters` mapped onto `global_rope_theta` (full attention, 160000) and `local_rope_theta` (sliding attention, 10000), and with the MLP GELU switched to the tanh form mlx-vlm's ModernBERT uses (`nn.GELU(approx="precise")`, `x**3` rounded once); the ModernBERT embedding and rerank paths keep HF's erf GELU. The head (`type_emb`, `head.layers.N`, `scorer.layers.N`, `act_head.layers.N`) is the shared marker head of `src/decision/marker_head.rs`; the unsplit PyTorch layout (`self_attn.in_proj_*`, `self_attn.out_proj`, `scorer.N`) is accepted too, and a missing or misshaped head tensor fails at load naming it. `mlxcel generate` refuses the checkpoint with a pointer to `mlxcel decide`.
+
+- **Rows.** One row per question, all questions in one right-padded batch: `[CLS]`, `{type} question: {instructions}` (`type` is `choice`, `score` or `noul`; non-string instructions as `json.dumps`), `[SEP]`, one `[MASK]` marker plus up to 48 tokens of each option, `[SEP]`, the state (a string as is, any other value as `json.dumps(..., ensure_ascii=False)`), `[SEP]`, at most `decision_config.max_len` (512) tokens. Options keep the request order: `choice` renders `label` or `label: description`, `score` renders `level i: text`, `bool` renders `false: ...` then `true: ...` with default descriptions the criteria override; non-string descriptions are JSON with Python's default separators. The question and its options share `head_max_len` (192) tokens; when fewer than 16 are left for the question, every option is cut to `max(4, (192 - 16) // n)` tokens. The `[MASK]` text inside caller text is replaced by a space.
+- **Readout.** The encoder hidden plus the question-type embedding runs through two pre-norm self-attention layers (16 heads, key padding mask), the scorer reads each marker, and each question's logits are divided by `temperature_by_options["{type}:{bucket}"]` (buckets `2`, `3-5`, `6-10`, `11+`), else `temperature[type]`, clamped to [0.5, 5.0], before an f32 softmax. `metadata.confidence` is one minus the normalized entropy of the option distribution (Laya's own definition, not the argmax probability), and `metadata.rl_agent.act_probability` is the first output of the action head. `bool` answers carry only `metadata.rl_agent`. Every probability is rounded to four places. `usage.input_tokens` is the sum of the row lengths.
+- **Model limits (400).** A question without `instructions` (`Laya questions need instructions`), options that push a marker past `max_len` (`Options do not fit the Laya question budget`), and a request whose rows need more than 2^20 tokens together (Decider-2b's bound, 2048 full 512-token rows). Rows run in padded batches of at most 2^16 tokens (128 full rows), so a large request does not become one `[questions, max_len]` forward; padding is masked, so the split moves numbers only by f16 rounding (within 5e-3 of one batch on the parity requests, same labels).
+- **Parity.** On `nativ-community/laya` (f16), token ids and marker positions match upstream exactly for nine row cases (a described choice, a score with a non-string level, bools with and without criteria, the option-capping branch, the mask token in caller text, a state longer than 512 tokens, JSON instructions and state, the budget failure; `tests/fixtures/decision/laya_parity.json`). The README request (department choice plus refund bool) matches mlx-vlm within 4e-4 with the same usage, and a five-question mixed request in one padded batch within 5e-4 with the same argmax everywhere (`src/decision/laya_parity_tests.rs`, bound 1e-3 on both). On an f32 copy of the checkpoint the two agree to four places on both requests (mlx-vlm run with `MLX_ENABLE_TF32=0`). Measured on CUDA (GB10) for both mlxcel and mlx-vlm; Metal was not run.
+
+```bash
+mlxcel decide -m nativ-community/laya --state "Please refund my duplicate charge" \
+  --questions '{"department": {"type": "choice", "instructions": "Which team should handle this ticket?", "criteria": {"billing": null, "technical": null, "sales": null}}, "refund": {"type": "bool", "instructions": "Does the customer request a refund?"}}'
 ```
 
 ## Endpoints
@@ -172,6 +187,8 @@ The command prints the `POST /v1/decisions` response JSON, pretty-printed with n
 | `src/decision/loader.rs` | `DecisionKind`, `detect_decision_kind`, `load_decision_model`. |
 | `src/decision/d1.rs`, `src/decision/d1_prompt.rs` | The LiquidAI d1 scorer (trunk/branch forward over the LFM2-VL stack) and its prompt, option codes and readout. |
 | `src/decision/decider2.rs`, `decider2_prompt.rs`, `decider2_rows.rs` | Decider-2b: loading, batched scoring over `Qwen35Model::forward_prefill_hidden`, question rendering and prompt ids, row planning and answers. |
+| `src/decision/laya.rs`, `laya_sequence.rs` | Laya: loading, the batched marker forward, rows and answers. |
+| `src/decision/head_layers.rs`, `marker_head.rs` | Head layers shared across families (linear, GELU, masked multi-head attention; the pre-norm marker decision head, marker batching and option-count calibration). |
 | `src/decision/cli.rs`, `src/decision/media.rs` | `mlxcel decide` input preparation, audio decoding, CLI media loading. |
 | `src/server/decision_model.rs` | `DecisionModelProvider` and `DecisionProviderError`. |
 | `src/server/decision_worker.rs` | `DecisionWorkerProvider` (bounded queue, timeout, panic boundary) and startup loading. |

@@ -1305,6 +1305,12 @@ pub(crate) fn detect_model_type_with_probes<P: ModelDetectionProbes + ?Sized>(
             "clef is a decision model; use `mlxcel decide` or `mlxcel-server --decision-model` (checkpoint {})",
             model_path.display()
         )),
+        // Laya scores option markers with a decision head over a ModernBERT
+        // encoder and never generates: `decision::loader` serves it (#2363).
+        "laya" => Err(anyhow::anyhow!(
+            "laya is a decision model; use `mlxcel decide` or `mlxcel-server --decision-model` (checkpoint {})",
+            model_path.display()
+        )),
         // A split-out MTP drafter (`gemma4_assistant`, `gemma4_unified_assistant`,
         // `qwen3_5_mtp`, ...) only runs bound to its target, through
         // `--draft-model`. Name that instead of "Unsupported model type".

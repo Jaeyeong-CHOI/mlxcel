@@ -27,7 +27,7 @@ use serde_json::{Value, json};
 
 use crate::embeddings::pooling::{PoolingMode, pool};
 use crate::models::modernbert::{
-    ModernBertArgs, ModernBertEncoder, geglu, sanitize_modernbert_weights,
+    MlpActivation, ModernBertArgs, ModernBertEncoder, geglu, sanitize_modernbert_weights,
 };
 use crate::models::modernbert_heads::ModernBertSequenceClassifier;
 use crate::models::{ModelType, get_model_type};
@@ -443,12 +443,49 @@ fn sliding_mask_attends_within_64_and_blocks_beyond() {
     assert!(at(1, 10, 149).is_infinite(), "far real key still blocked");
 }
 
+/// `MlpActivation::MlxGeluApprox` is MLX's `nn.gelu_approx` (the tanh form
+/// mlx-vlm's ModernBERT MLP uses, ported for Laya), not the erf default, and
+/// stays finite for negative f16 inputs (the cube is formed in f32, never
+/// through `power` of a negative base).
+#[test]
+fn mlx_gelu_approx_is_the_tanh_form_in_the_input_dtype() {
+    let _mlx = mlx_guard();
+    let inputs = [-4.0f32, -1.5, -0.25, 0.0, 0.75, 2.5];
+    let gate = [1.0f32; 6];
+    let y = mlxcel_core::from_slice_f32(&[&inputs[..], &gate[..]].concat(), &[1, 1, 12]);
+    let tanh_form = |x: f64| {
+        0.5 * x * (1.0 + ((2.0 / std::f64::consts::PI).sqrt() * (x + 0.044715 * x.powi(3))).tanh())
+    };
+    let got = array_to_vec_f32(&geglu(&y, 6, MlpActivation::MlxGeluApprox));
+    let expected: Vec<f32> = inputs
+        .iter()
+        .map(|&x| tanh_form(f64::from(x)) as f32)
+        .collect();
+    assert_close(&got, &expected, 1e-6, "tanh gelu f32");
+    // erf and tanh differ by more than f32 noise at x = -1.5, so the variant
+    // cannot silently fall back to the default.
+    let erf = array_to_vec_f32(&geglu(&y, 6, MlpActivation::Erf));
+    assert!(
+        (erf[1] - got[1]).abs() > 1e-4,
+        "erf {} vs tanh {}",
+        erf[1],
+        got[1]
+    );
+
+    let half = mlxcel_core::astype(&y, mlxcel_core::dtype::FLOAT16);
+    let out = geglu(&half, 6, MlpActivation::MlxGeluApprox);
+    assert_eq!(mlxcel_core::array_dtype(&out), mlxcel_core::dtype::FLOAT16);
+    let got = array_to_vec_f32(&out);
+    assert!(got.iter().all(|value| value.is_finite()), "{got:?}");
+    assert_close(&got, &expected, 5e-3, "tanh gelu f16");
+}
+
 #[test]
 fn geglu_splits_input_then_gate() {
     let _mlx = mlx_guard();
     // Direct: y = [inputs | gate], output = gelu(input) * gate.
     let y = mlxcel_core::from_slice_f32(&[1.0, -2.0, 3.0, 0.5, 2.0, -1.0], &[1, 1, 6]);
-    let out = geglu(&y, 3);
+    let out = geglu(&y, 3, MlpActivation::Erf);
     assert_eq!(mlxcel_core::array_shape(&out), vec![1, 1, 3]);
     let got = array_to_vec_f32(&out);
     let gelu_exact = |x: f32| x * 0.5 * (1.0 + erf_approx(x / std::f32::consts::SQRT_2));

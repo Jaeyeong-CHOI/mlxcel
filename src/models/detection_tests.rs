@@ -2662,6 +2662,27 @@ fn clef_is_refused_with_the_decision_entry_points() {
     );
 }
 
+/// Laya is a decision model: `mlxcel generate` names the decision entry
+/// points instead of the generic unsupported-type error (#2363).
+#[test]
+fn laya_is_refused_with_the_decision_entry_points() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(
+        directory.path().join("config.json"),
+        r#"{"model_type": "laya", "head_layers": 2}"#,
+    )
+    .unwrap();
+    let error = super::detection::get_model_type(directory.path())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains(
+            "laya is a decision model; use `mlxcel decide` or `mlxcel-server --decision-model`"
+        ),
+        "{error}"
+    );
+}
+
 #[test]
 fn longcat_flash_sparse_is_detected_with_and_without_model_type() {
     // The original `meituan-longcat/LongCat-Flash-Lite-Sparse` config omits

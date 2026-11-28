@@ -27,10 +27,8 @@ use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr, dtype};
 use serde::Deserialize;
 
-use super::clef_layers::{EvidenceRoutingLayer, FieldDecoderLayer, Linear, Weights, gelu};
-
-/// `nn.LayerNorm`'s default epsilon.
-pub(super) const LAYER_NORM_EPS: f32 = 1e-5;
+use super::clef_layers::{EvidenceRoutingLayer, FieldDecoderLayer};
+use super::head_layers::{Linear, Weights, gelu, scalar_like, split_packed_projection};
 
 /// `config.json` `head_config`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -95,23 +93,7 @@ pub(crate) fn sanitize_head_weights(raw: WeightMap) -> Result<WeightMap> {
         if let Some((prefix, suffix)) = key.rsplit_once(".in_proj_")
             && (suffix == "weight" || suffix == "bias")
         {
-            let rows = mlxcel_core::array_shape(&value)
-                .first()
-                .copied()
-                .unwrap_or(0);
-            if rows <= 0 || rows % 3 != 0 {
-                bail!("clef head tensor {key} has {rows} rows, not a multiple of 3");
-            }
-            let part = rows / 3;
-            let ndim = mlxcel_core::array_shape(&value).len();
-            for (index, name) in ["query_proj", "key_proj", "value_proj"].iter().enumerate() {
-                let mut start = vec![0; ndim];
-                let mut stop = mlxcel_core::array_shape(&value);
-                start[0] = part * index as i32;
-                stop[0] = part * (index as i32 + 1);
-                let piece = mlxcel_core::slice(&value, &start, &stop);
-                out.insert(format!("{prefix}.{name}.{suffix}"), piece);
-            }
+            split_packed_projection(&mut out, &key, prefix, suffix, &value, "clef")?;
             continue;
         }
         let key = key
@@ -181,10 +163,6 @@ pub(crate) fn span_means(
     mlxcel_core::astype(&product, out_dtype)
 }
 
-pub(super) fn scalar_like(value: f32, dtype: i32) -> UniquePtr<MlxArray> {
-    mlxcel_core::astype(&mlxcel_core::from_slice_f32(&[value], &[]), dtype)
-}
-
 /// `x / max(||x||, eps)` along the last axis, in `x`'s dtype.
 fn normalize(x: &MlxArray, eps: f32) -> UniquePtr<MlxArray> {
     let norm = mlxcel_core::linalg_norm(x, -1, true);
@@ -217,7 +195,10 @@ fn first(x: &MlxArray) -> UniquePtr<MlxArray> {
 impl JointSchemaHead {
     /// Build the head from sanitized `head.*` tensors.
     pub(crate) fn from_weights(weights: &WeightMap, config: &HeadConfig) -> Result<Self> {
-        let w = Weights { map: weights };
+        let w = Weights {
+            map: weights,
+            family: "clef",
+        };
         let p = |name: &str| format!("head.{name}");
         let evidence_layers = (0..config.routing_layers)
             .map(|i| {

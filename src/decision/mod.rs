@@ -33,6 +33,11 @@
 //! - `decider2*`: the Decider-2b scorer (`decider2`).
 //! - `clef*`: the Clef / Clef-Flash scorer (`clef`): the model, its joint
 //!   schema head, its sequence and its video sampling.
+//! - `laya*`: the Laya scorer (`laya`): a ModernBERT encoder read by the
+//!   marker head, and its rows.
+//! - `head_layers`, `marker_head`: head building blocks shared across
+//!   families (linear, GELU, masked multi-head attention; the pre-norm
+//!   marker decision head and its calibration).
 //! - [`cli`]: `mlxcel decide` input preparation (pure, testable before load).
 //! - [`media`]: audio decoding to 16 kHz mono and CLI media loading.
 //!
@@ -71,7 +76,11 @@ pub(crate) mod d1_prompt;
 pub(crate) mod decider2;
 pub(crate) mod decider2_prompt;
 pub(crate) mod decider2_rows;
+pub(crate) mod head_layers;
+pub(crate) mod laya;
+pub(crate) mod laya_sequence;
 pub mod loader;
+pub(crate) mod marker_head;
 pub mod media;
 pub mod validate;
 
@@ -109,6 +118,14 @@ mod clef_parity_tests;
 #[cfg(test)]
 #[path = "clef_limits_tests.rs"]
 mod clef_limits_tests;
+
+#[cfg(test)]
+#[path = "laya_tests.rs"]
+mod laya_tests;
+
+#[cfg(test)]
+#[path = "laya_parity_tests.rs"]
+mod laya_parity_tests;
 
 use serde_json::{Map, Value};
 use thiserror::Error;

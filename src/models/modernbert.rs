@@ -40,7 +40,10 @@
 //!   the matmul, never by slicing the weight, because a quantized export packs
 //!   each as one tensor.
 //! - `hidden_activation` is `gelu`, meaning the exact erf form
-//!   ([`mlxcel_core::gelu`]), not the tanh approximation.
+//!   ([`mlxcel_core::gelu`]), not the tanh approximation. A caller that ports
+//!   mlx-vlm's copy, whose MLP uses `nn.GELU(approx="precise")` (tanh), opts
+//!   in through [`ModernBertEncoder::with_mlp_activation`] and
+//!   [`MlpActivation::MlxGeluApprox`].
 //!
 //! # Untrusted config
 //!
@@ -55,7 +58,7 @@ use mlxcel_core::utils::{
     create_bidirectional_padding_mask, create_bidirectional_window_mask, slice_axis,
 };
 use mlxcel_core::weights::WeightMap;
-use mlxcel_core::{MlxArray, UniquePtr};
+use mlxcel_core::{MlxArray, UniquePtr, dtype};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -345,17 +348,71 @@ struct Geometry {
     head_dim: i32,
     intermediate_size: i32,
     scale: f32,
+    /// GELU of the MLP's input half (erf unless a caller opts out).
+    mlp_activation: MlpActivation,
+}
+
+/// The GELU a ModernBERT MLP applies to the input half of `Wi`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MlpActivation {
+    /// Exact erf GELU ([`mlxcel_core::gelu`]), HF `hidden_activation = gelu`.
+    /// The embedding and rerank paths use it.
+    #[default]
+    Erf,
+    /// MLX's `nn.gelu_approx`, which mlx-vlm's ModernBERT MLP runs through
+    /// `nn.GELU(approx="precise")`; see [`mlx_gelu_approx`].
+    MlxGeluApprox,
+}
+
+impl MlpActivation {
+    fn apply(self, x: &MlxArray) -> UniquePtr<MlxArray> {
+        match self {
+            Self::Erf => mlxcel_core::gelu(x),
+            Self::MlxGeluApprox => mlx_gelu_approx(x),
+        }
+    }
+}
+
+/// MLX's `nn.gelu_approx`,
+/// `0.5 * x * (1 + tanh(sqrt(2 / pi) * (x + 0.044715 * x**3)))`, every step
+/// in `x`'s dtype (the Python constants are weak scalars).
+///
+/// The cube is the one rounding of `x**3`: formed in f32 and cast back, which
+/// is what `power(x, 3)` returns for an f16 or bf16 `x` without taking a log
+/// of a negative base. The shared tanh helper's `x * x * x` rounds twice in
+/// f16; on Laya's f16 checkpoint that alone moved a probability of the mixed
+/// parity request by 3.3e-3 against mlx-vlm.
+///
+/// Used by: [`MlpActivation::MlxGeluApprox`] (Laya, `decision/laya.rs`).
+fn mlx_gelu_approx(x: &MlxArray) -> UniquePtr<MlxArray> {
+    let x_dtype = mlxcel_core::array_dtype(x);
+    let scalar =
+        |value: f32| mlxcel_core::astype(&mlxcel_core::from_slice_f32(&[value], &[]), x_dtype);
+    let wide = mlxcel_core::astype(x, dtype::FLOAT32);
+    let cube = mlxcel_core::multiply(&mlxcel_core::multiply(&wide, &wide), &wide);
+    let cube = mlxcel_core::astype(&cube, x_dtype);
+    let inner = mlxcel_core::multiply(
+        &scalar((2.0 / std::f32::consts::PI).sqrt()),
+        &mlxcel_core::add(x, &mlxcel_core::multiply(&scalar(0.044_715), &cube)),
+    );
+    let lifted = mlxcel_core::add(&scalar(1.0), &mlxcel_core::tanh(&inner));
+    mlxcel_core::multiply(&mlxcel_core::multiply(&scalar(0.5), x), &lifted)
 }
 
 /// Apply the GeGLU half-split of a fused `Wi` output.
 ///
 /// `y` is `[.., 2 * intermediate]`; the first half is the activated input and
 /// the second half is the multiplicative gate, matching upstream's
-/// `input, gate = Wi(x).chunk(2, dim=-1)`.
-pub(crate) fn geglu(y: &MlxArray, intermediate: i32) -> UniquePtr<MlxArray> {
+/// `input, gate = Wi(x).chunk(2, dim=-1)`. `activation` is the GELU applied
+/// to the input half: [`MlpActivation::Erf`] (HF `gelu`) by default.
+pub(crate) fn geglu(
+    y: &MlxArray,
+    intermediate: i32,
+    activation: MlpActivation,
+) -> UniquePtr<MlxArray> {
     let input = slice_axis(y, -1, 0, intermediate);
     let gate = slice_axis(y, -1, intermediate, 2 * intermediate);
-    mlxcel_core::multiply(&mlxcel_core::gelu(&input), &gate)
+    mlxcel_core::multiply(&activation.apply(&input), &gate)
 }
 
 /// One pre-norm ModernBERT block.
@@ -468,9 +525,11 @@ impl ModernBertLayer {
         let h = mlxcel_core::add(h, &self.attention(normed, mask, geo));
 
         let projected = self.wi.forward(&self.mlp_norm.forward(&h));
-        let mlp = self
-            .mlp_wo
-            .forward(&geglu(&projected, geo.intermediate_size));
+        let mlp = self.mlp_wo.forward(&geglu(
+            &projected,
+            geo.intermediate_size,
+            geo.mlp_activation,
+        ));
         mlxcel_core::add(&h, &mlp)
     }
 }
@@ -533,11 +592,22 @@ impl ModernBertEncoder {
                 head_dim: head_dim as i32,
                 intermediate_size: args.intermediate_size as i32,
                 scale: (head_dim as f32).powf(-0.5),
+                mlp_activation: MlpActivation::Erf,
             },
             local_window: args.local_window(),
             hidden_size: args.hidden_size,
             vocab_size: args.vocab_size,
         })
+    }
+
+    /// Use `activation` instead of the exact erf GELU in every MLP.
+    ///
+    /// Used by: Laya (`decision/laya.rs`), whose mlx-vlm reference runs the
+    /// ModernBERT MLP with `nn.GELU(approx="precise")`, the tanh form.
+    #[must_use]
+    pub fn with_mlp_activation(mut self, activation: MlpActivation) -> Self {
+        self.geometry.mlp_activation = activation;
+        self
     }
 
     /// Width `D` of one hidden state.
