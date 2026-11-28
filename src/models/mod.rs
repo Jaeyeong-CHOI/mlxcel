@@ -314,6 +314,10 @@ pub mod phi4mm;
 pub mod phimoe;
 pub mod phixtral;
 pub mod plamo2;
+pub mod plamo3;
+pub mod plamo3_config;
+pub mod plamo3_layers;
+mod plamo3_lm;
 pub mod qwen2;
 pub mod qwen2_moe;
 pub mod qwen2_vl;
@@ -495,6 +499,7 @@ pub use phi4mm::Phi4MMModel;
 pub use phimoe::PhiMoeModel;
 pub use phixtral::PhixtralModel;
 pub use plamo2::Plamo2Model;
+pub use plamo3::Plamo3Model;
 pub use qwen2::Qwen2Model;
 pub use qwen2_moe::Qwen2MoeModel;
 pub use qwen2_vl::Qwen2VLModel;
@@ -811,6 +816,9 @@ pub enum ModelType {
     // Preferred Networks PLaMo 2 (Mamba + attention interleaved hybrid)
     Plamo2,
     Plamo2VLM, // PLaMo 2.1 VL (plamo2vl): SigLIP tiles + RMSNorm/GELU adapter + PLaMo 2 text
+    /// Preferred Networks PLaMo 3 (`plamo3`): dense sliding/full attention hybrid
+    /// with q/k norms, offset RMSNorms and YaRN on the full-attention layers.
+    Plamo3,
 
     // IBM Granite 4.x (Mamba2 + attention interleaved hybrid)
     GraniteMoeHybrid,
@@ -1070,6 +1078,7 @@ pub const ALL_MODEL_TYPES: &[ModelType] = &[
     // Preferred Networks PLaMo 2
     ModelType::Plamo2,
     ModelType::Plamo2VLM,
+    ModelType::Plamo3,
     // IBM Granite 4.x hybrid
     ModelType::GraniteMoeHybrid,
     // Kimi models
@@ -1372,6 +1381,10 @@ impl ModelType {
 
             // ----- Preferred Networks -----
             ModelType::Plamo2 => ("PLaMo 2 (Mamba + attention hybrid)", "PLaMo"),
+            ModelType::Plamo3 => (
+                "PLaMo 3 (sliding + full attention hybrid, YaRN full layers)",
+                "PLaMo",
+            ),
             ModelType::Plamo2VLM => (
                 "PLaMo 2.1 VL (SigLIP tiles + MLP adapter + PLaMo 2 hybrid)",
                 "Other VLM",
@@ -1764,6 +1777,7 @@ mod metadata_tests {
             Inkling2VLM,
             Plamo2,
             Plamo2VLM,
+            Plamo3,
             GraniteMoeHybrid,
             KimiLinear,
             KimiK3,
