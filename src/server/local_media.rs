@@ -156,6 +156,20 @@ pub fn prepare_local_vlm_embeddings(
     prompt_tokens: &mut Vec<i32>,
     media: LocalMedia<'_>,
 ) -> Result<Option<InputEmbeddings>> {
+    prepare_local_vlm_embeddings_with_prefix(model, tokenizer, prompt, prompt_tokens, media, &mut 0)
+}
+
+/// Also report how many leading KV positions represent image-only embeddings.
+/// The CLI sampler excludes that span from the repetition history.
+pub fn prepare_local_vlm_embeddings_with_prefix(
+    model: &LoadedModel,
+    tokenizer: &MlxcelTokenizer,
+    prompt: &str,
+    prompt_tokens: &mut Vec<i32>,
+    media: LocalMedia<'_>,
+    visual_prefix_len: &mut usize,
+) -> Result<Option<InputEmbeddings>> {
+    *visual_prefix_len = 0;
     let images = read_files(media.images, "image")?;
     let audio = match media.audio {
         Some(path) => read_files(&[path.to_path_buf()], "audio")?,
@@ -194,6 +208,7 @@ pub fn prepare_local_vlm_embeddings(
     }
     prepare_request_vlm_embeddings(
         model,
+        visual_prefix_len,
         tokenizer,
         prompt,
         prompt_tokens,

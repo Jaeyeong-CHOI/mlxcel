@@ -407,7 +407,27 @@ pub(crate) fn media_capability_rejection(
         };
         Some(crate::server::types::ErrorResponse::not_supported(message))
     };
-    if !support.image && !request.image_urls().is_empty() {
+    let images = || {
+        request
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter_image_parts())
+    };
+    if support.single_page_required
+        && !matches!(request.messages.as_slice(), [message] if message.role == super::types::Role::User)
+    {
+        return Some(crate::server::types::ErrorResponse::new(
+            "Nemotron 3.5 Parse requires a single user message containing the page and control prompt",
+            "invalid_request_error",
+        ));
+    }
+    if support.single_page_required && images().take(2).count() != 1 {
+        return Some(crate::server::types::ErrorResponse::new(
+            "Nemotron 3.5 Parse requires one page image",
+            "invalid_request_error",
+        ));
+    }
+    if !support.image && images().next().is_some() {
         return refuse("image");
     }
     if !support.audio && (!request.audio_inputs().is_empty() || request.has_audio_urls()) {

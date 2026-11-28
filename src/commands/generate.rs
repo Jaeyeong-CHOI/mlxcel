@@ -1286,6 +1286,7 @@ struct CliSamplingFlagState {
     temperature: bool,
     top_p: bool,
     top_k: bool,
+    repetition_penalty: bool,
 }
 
 fn current_cli_sampling_flags() -> CliSamplingFlagState {
@@ -1293,6 +1294,7 @@ fn current_cli_sampling_flags() -> CliSamplingFlagState {
         temperature: mlxcel::server::long_cli_flag_was_set("temp") || short_cli_flag_was_set('t'),
         top_p: mlxcel::server::long_cli_flag_was_set("top-p"),
         top_k: mlxcel::server::long_cli_flag_was_set("top-k"),
+        repetition_penalty: mlxcel::server::long_cli_flag_was_set("repetition-penalty"),
     }
 }
 
@@ -1329,7 +1331,13 @@ fn resolved_cli_sampling_params(
         },
         min_p: args.sampling.min_p,
         seed: args.sampling.seed,
-        repetition_penalty: args.sampling.repetition_penalty,
+        repetition_penalty: if flags.repetition_penalty {
+            args.sampling.repetition_penalty
+        } else {
+            generation_defaults
+                .repetition_penalty
+                .unwrap_or(args.sampling.repetition_penalty)
+        },
         dry_multiplier: args.sampling.dry_multiplier,
         // b10621's CLI silently keeps the default when dry_base < 1.0
         // (#1436), and so does this path.
@@ -1980,6 +1988,7 @@ pub(super) fn run_generation_mode(
     kv_cache_mode: KVCacheMode,
     language_bias: TokenBiasMap,
 ) -> Result<(Vec<i32>, GenerationStats)> {
+    model.validate_generation_length(prompt_tokens.len(), max_tokens)?;
     // The request's effective token bias, composed once by the rule the server
     // uses too (#2169, `compose_token_bias`): `mlxcel generate` has no
     // per-request `logit_bias`, so the `--lang-bias` map applies, and the
@@ -3358,18 +3367,25 @@ fn run_generate_once(mut args: GenerateArgs) -> Result<()> {
     // every downstream consumer (the memory preflight below, plus the standard /
     // VLM / speculative / XLA / pipeline generators) reads a plain usize. An
     // explicit `-n N` passes through unchanged.
-    args.generation.max_tokens = resolve_cli_max_tokens(
-        args.generation.max_tokens,
-        &args.model.model,
-        prompt_tokens.len(),
-    );
+    if args.generation.max_tokens == mlxcel::cli::max_tokens::UNLIMITED_MAX_TOKENS
+        && !mlxcel::server::long_cli_flag_was_set("max-tokens")
+        && !short_cli_flag_was_set('n')
+        && let Some(n) = mlxcel::read_generation_config_defaults(&args.model.model).max_new_tokens
+    {
+        args.generation.max_tokens = n;
+    }
+    // Keep the requested budget: preflight sees only the rendered text, while
+    // Parse 3.5 inserts a variable-length page prefix after the model loads.
+    let requested_max_tokens = args.generation.max_tokens;
+    args.generation.max_tokens =
+        resolve_cli_max_tokens(requested_max_tokens, &args.model.model, prompt_tokens.len());
 
     // Memory preflight (issue #56). Runs after prompt rendering/tokenization so
     // long prompts are included in the KV-cache budget, but still before the
     // model weights are loaded.
     let preflight_estimate = run_memory_preflight(&args, prompt_tokens.len())?;
 
-    let sampling_config =
+    let mut sampling_config =
         build_cli_sampling_config(&args, mlxcel::read_eos_token_ids(&args.model.model));
 
     // Axis B (B8): resolve the parsed LangBiasConfig into a concrete
@@ -3638,7 +3654,7 @@ fn run_generate_once(mut args: GenerateArgs) -> Result<()> {
         // dispatch the model worker runs for a chat request with these bytes,
         // with Inkling audio and video kept on the layouts this prompt form
         // used before (Plain under --no-chat-template).
-        let vlm_embeddings = mlxcel::server::local_media::prepare_local_vlm_embeddings(
+        let vlm_embeddings = mlxcel::server::local_media::prepare_local_vlm_embeddings_with_prefix(
             &model,
             &tokenizer,
             &prompt,
@@ -3653,7 +3669,17 @@ fn run_generate_once(mut args: GenerateArgs) -> Result<()> {
                 image_soft_tokens,
                 no_chat_template: args.generation.no_chat_template,
             },
+            &mut sampling_config.visual_prefix_len,
         )?;
+        if requested_max_tokens == mlxcel::cli::max_tokens::UNLIMITED_MAX_TOKENS
+            && let mlxcel::LoadedModel::NemotronParseV35VLM(parse) = &model
+        {
+            args.generation.max_tokens = parse.remaining_generation_budget(prompt_tokens.len());
+            println!(
+                "Max tokens with page prefix: {}",
+                args.generation.max_tokens
+            );
+        }
         print_generation_preamble(&user_prompt, prompt != user_prompt)?;
         let generation = run_generation_mode(
             &model,

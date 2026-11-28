@@ -41,6 +41,7 @@ fn muse_glimmer_generation_defaults_match_pinned_fixture() {
             top_p: Some(0.95),
             top_k: Some(64),
             presence_penalty: None,
+            ..Default::default()
         }
     );
     assert_eq!(read_eos_token_ids(dir.path()), vec![200001, 200008]);
@@ -295,5 +296,25 @@ fn generation_defaults_read_a_finite_non_negative_presence_penalty() {
             None,
             "{bad}"
         );
+    }
+}
+
+#[test]
+fn nemotron_parse_v35_applies_checkpoint_defaults_only_to_the_prefix_decoder() {
+    let dir = write_generation_config(
+        r#"{"do_sample":false,"temperature":0.6,"repetition_penalty":1.1,"max_new_tokens":9000,"eos_token_id":2}"#,
+    );
+    for (family, prefix) in [("nemotron_parse_v3_5", true), ("nemotron_parse", false)] {
+        fs::write(
+            dir.path().join("config.json"),
+            serde_json::json!({"model_type":family}).to_string(),
+        )
+        .unwrap();
+        let d = read_generation_config_defaults(dir.path());
+        assert_eq!(d.repetition_penalty, prefix.then_some(1.1));
+        assert_eq!(d.max_new_tokens, prefix.then_some(9000));
+        assert_eq!(d.temperature, Some(if prefix { 0. } else { 0.6 }));
+        assert_eq!(d.full_repetition_history, prefix);
+        assert_eq!(d.eos_token_ids, [2]);
     }
 }

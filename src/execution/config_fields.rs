@@ -95,6 +95,15 @@ pub(crate) fn text_config(config: &Value) -> &Value {
 ///
 /// Used by: [`kv_decoder_model_type`], `execution::kv_arch` (sizing).
 pub(crate) fn kv_decoder_config(config: &Value) -> Cow<'_, Value> {
+    use crate::models::nemotron_parse_v35::config::{NemotronParseV35Config, is_prefix_decoder};
+    if is_prefix_decoder(config)
+        && let Ok(c) = NemotronParseV35Config::parse(config)
+    {
+        return Cow::Owned(serde_json::json!({
+            "model_type":"nemotron_parse_v3_5", "num_hidden_layers":c.layers,
+            "hidden_size":c.width, "num_attention_heads":c.heads, "num_key_value_heads":c.kv_heads
+        }));
+    }
     if let Some(text) = config.get("text_config") {
         return Cow::Borrowed(text);
     }

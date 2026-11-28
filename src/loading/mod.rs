@@ -270,6 +270,10 @@ fn tokenizer_json_eos_token_ids(
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct GenerationConfigDefaults {
     pub eos_token_ids: Vec<i32>,
+    /// Opt-in defaults for prefix-causal document parsing.
+    pub repetition_penalty: Option<f32>,
+    pub max_new_tokens: Option<usize>,
+    pub full_repetition_history: bool,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub top_k: Option<i32>,
@@ -286,6 +290,7 @@ fn parse_generation_config_defaults(config: &serde_json::Value) -> GenerationCon
         top_p: parse_finite_f32_field(config, "top_p"),
         top_k: parse_i32_field(config, "top_k"),
         presence_penalty: parse_presence_penalty(config),
+        ..Default::default()
     }
 }
 
@@ -451,6 +456,7 @@ fn try_load_vlm_model_from_dir(
         ModelType::Moondream2VLM => Some(load_moondream2_vlm(model_path)?),
         ModelType::Florence2VLM => Some(load_florence2_vlm(model_path)?),
         ModelType::NemotronParseVLM => Some(load_nemotron_parse_vlm(model_path)?),
+        ModelType::NemotronParseV35VLM => Some(vlm::load_nemotron_parse_v35(model_path)?),
         ModelType::NemotronVoiceChat => Some(LoadedModel::NemotronVoiceChat(
             crate::models::NemotronVoiceChatModel::load(model_path)?,
         )),
@@ -571,7 +577,21 @@ pub fn read_generation_config_defaults(model_dir: &Path) -> GenerationConfigDefa
     let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) else {
         return GenerationConfigDefaults::default();
     };
-    parse_generation_config_defaults(&config)
+    let mut defaults = parse_generation_config_defaults(&config);
+    if vlm::read_sanitized_vlm_config(model_dir)
+        .is_ok_and(|(_, cfg)| models::nemotron_parse_v35::config::is_prefix_decoder(&cfg))
+    {
+        defaults.repetition_penalty =
+            parse_finite_f32_field(&config, "repetition_penalty").filter(|p| *p > 0.);
+        defaults.max_new_tokens = config["max_new_tokens"]
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok());
+        defaults.full_repetition_history = true;
+        if config["do_sample"] == false {
+            defaults.temperature = Some(0.);
+        }
+    }
+    defaults
 }
 
 /// Read EOS token IDs from the checkpoint sidecars.

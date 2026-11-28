@@ -438,6 +438,8 @@ pub struct ModelMediaSupport {
     /// from a described one. It is now refused with b10621's own
     /// `image input is not supported` wording.
     pub image: bool,
+    /// This document parser accepts one user message containing one page.
+    pub single_page_required: bool,
     /// `true` when the loaded checkpoint can consume `input_audio` content
     /// blocks. A checkpoint that is not multimodal at all refuses them here;
     /// a multimodal checkpoint without an audio tower still refuses later, on
@@ -499,6 +501,7 @@ impl ModelMediaSupport {
             video_native: false,
             video_frames_fallback: false,
             video_with_audio: false,
+            single_page_required: false,
             audio_refusal: None,
         }
     }

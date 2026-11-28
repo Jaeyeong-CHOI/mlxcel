@@ -158,6 +158,11 @@ fn non_chat_family_error(model_path: &Path) -> Option<anyhow::Error> {
              instead: mlxcel generate -m <model> --image <page> -p \
              '</s><s><predict_bbox><predict_classes><output_markdown><predict_no_text_in_pic>'"
         }
+        ModelType::NemotronParseV35VLM => {
+            "Nemotron 3.5 Parse takes a single page and control prompt. Use \
+             mlxcel generate -m <model> --image <page> -p \
+             '</s><s><predict_bbox><predict_classes><output_markdown><predict_text_in_pic>'"
+        }
         _ => return None,
     };
     Some(anyhow!(message))

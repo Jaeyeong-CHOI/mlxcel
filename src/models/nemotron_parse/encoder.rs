@@ -37,36 +37,46 @@ use super::config::NemotronParseVisionConfig;
 /// both references); the decoder uses the torch default 1e-5 instead.
 pub(crate) const VISION_LN_EPS: f32 = 1e-6;
 
+/// Used by: the shared Parse RADIO tower and neck, and the Parse 3.5 decoder.
 pub(crate) fn layer_norm_eps(
     weights: &WeightMap,
     prefix: &str,
     eps: f32,
+    width: i32,
 ) -> Result<LayerNorm, String> {
-    let weight = weights
-        .get(&format!("{prefix}.weight"))
-        .map(|w| mlxcel_core::copy(w))
-        .ok_or_else(|| format!("Nemotron-Parse weight not found: {prefix}.weight"))?;
+    let weight_key = format!("{prefix}.weight");
+    let bias_key = format!("{prefix}.bias");
+    let weight = crate::vision::weights::load_dense_param(weights, &weight_key, &[width], None)?;
     let bias = weights
-        .get(&format!("{prefix}.bias"))
-        .map(|w| mlxcel_core::copy(w));
+        .get(&bias_key)
+        .map(|_| crate::vision::weights::load_dense_param(weights, &bias_key, &[width], None))
+        .transpose()?;
     Ok(LayerNorm::new(weight, bias, eps))
 }
 
-pub(crate) fn dense_or_quantized(
+/// Validate logical shape, dtype and sidecars before constructing the layer.
+/// Used by: RADIO patch embed, transformer blocks and compression neck, and the 3.5 decoder.
+pub(crate) fn checked_linear(
     weights: &WeightMap,
-    prefix: &str,
+    key: &str,
+    shape: [i32; 2],
     group_size: i32,
     bits: i32,
 ) -> Result<UnifiedLinear, String> {
-    UnifiedLinear::from_weights(weights, prefix, group_size, bits)
+    let quant = crate::vision::weights::resolve_param_quantization(
+        weights,
+        &format!("{key}.weight"),
+        &shape,
+        Some((group_size, bits)),
+    )?
+    .unwrap_or((group_size, bits));
+    if let Some(bias) = weights.get(&format!("{key}.bias"))
+        && mlxcel_core::array_shape(bias) != [shape[0]]
+    {
+        return Err(format!("{key}.bias must have {} rows", shape[0]));
+    }
+    UnifiedLinear::from_weights(weights, key, quant.0, quant.1)
         .map_err(|e| format!("Nemotron-Parse {e}"))
-}
-
-fn require(weights: &WeightMap, key: &str) -> Result<UniquePtr<MlxArray>, String> {
-    weights
-        .get(key)
-        .map(|w| mlxcel_core::copy(w))
-        .ok_or_else(|| format!("Nemotron-Parse weight not found: {key}"))
 }
 
 /// Row-interpolation matrix `[out, in]` for 1-D bilinear resampling with
@@ -164,12 +174,51 @@ impl RadioBlock {
     ) -> Result<Self, String> {
         let head_dim = cfg.hidden_size / cfg.num_heads;
         Ok(Self {
-            norm1: layer_norm_eps(weights, &format!("{prefix}.norm1"), VISION_LN_EPS)?,
-            qkv: dense_or_quantized(weights, &format!("{prefix}.attn.qkv"), group_size, bits)?,
-            proj: dense_or_quantized(weights, &format!("{prefix}.attn.proj"), group_size, bits)?,
-            norm2: layer_norm_eps(weights, &format!("{prefix}.norm2"), VISION_LN_EPS)?,
-            fc1: dense_or_quantized(weights, &format!("{prefix}.mlp.fc1"), group_size, bits)?,
-            fc2: dense_or_quantized(weights, &format!("{prefix}.mlp.fc2"), group_size, bits)?,
+            norm1: layer_norm_eps(
+                weights,
+                &format!("{prefix}.norm1"),
+                VISION_LN_EPS,
+                cfg.hidden_size,
+            )?,
+            qkv: checked_linear(
+                weights,
+                &format!("{prefix}.attn.qkv"),
+                [
+                    cfg.hidden_size
+                        .checked_mul(3)
+                        .ok_or("RADIO QKV width overflow")?,
+                    cfg.hidden_size,
+                ],
+                group_size,
+                bits,
+            )?,
+            proj: checked_linear(
+                weights,
+                &format!("{prefix}.attn.proj"),
+                [cfg.hidden_size, cfg.hidden_size],
+                group_size,
+                bits,
+            )?,
+            norm2: layer_norm_eps(
+                weights,
+                &format!("{prefix}.norm2"),
+                VISION_LN_EPS,
+                cfg.hidden_size,
+            )?,
+            fc1: checked_linear(
+                weights,
+                &format!("{prefix}.mlp.fc1"),
+                [cfg.mlp_dim, cfg.hidden_size],
+                group_size,
+                bits,
+            )?,
+            fc2: checked_linear(
+                weights,
+                &format!("{prefix}.mlp.fc2"),
+                [cfg.hidden_size, cfg.mlp_dim],
+                group_size,
+                bits,
+            )?,
             num_heads: cfg.num_heads,
             scale: (head_dim as f32).powf(-0.5),
         })
@@ -239,36 +288,42 @@ impl RadioVisionTower {
         bits: i32,
     ) -> Result<Self, String> {
         let c = config.hidden_size;
-        let patch_dim = 3 * config.patch_size * config.patch_size;
-        let patch_embed =
-            dense_or_quantized(weights, &format!("{prefix}.patch_embed"), group_size, bits)?;
-        let pe_key = format!("{prefix}.patch_embed.weight");
-        if !patch_embed.is_quantized() {
-            let pe = require(weights, &pe_key)?;
-            let shape = mlxcel_core::array_shape(&pe);
-            if shape != [c, patch_dim] {
-                return Err(format!(
-                    "Nemotron-Parse {pe_key} has shape {shape:?}, expected [{c}, {patch_dim}]"
-                ));
-            }
-        }
+        let patch_dim = config
+            .patch_size
+            .checked_mul(config.patch_size)
+            .and_then(|n| n.checked_mul(3))
+            .ok_or("RADIO patch_embed width overflow")?;
+        let patch_embed = checked_linear(
+            weights,
+            &format!("{prefix}.patch_embed"),
+            [c, patch_dim],
+            group_size,
+            bits,
+        )?;
 
         let pos_key = format!("{prefix}.pos_embed");
-        let pos = require(weights, &pos_key)?;
         let g = config.pos_grid;
-        let numel: i64 = mlxcel_core::array_shape(&pos)
-            .iter()
-            .map(|d| *d as i64)
-            .product();
-        if numel != g as i64 * g as i64 * c as i64 {
-            return Err(format!(
-                "Nemotron-Parse {pos_key} has {numel} elements, expected {g}x{g}x{c}"
-            ));
-        }
+        let grid_size = g.checked_mul(g).ok_or("RADIO pos_embed grid overflow")?;
+        let physical = weights
+            .get(&pos_key)
+            .ok_or_else(|| format!("Missing {pos_key}"))?;
+        let expected = match mlxcel_core::array_shape(physical).as_slice() {
+            [1, _, _] => vec![1, grid_size, c],
+            [_, _] => vec![grid_size, c],
+            [_, _, _] => vec![g, g, c],
+            shape => return Err(format!("Invalid {pos_key} shape {shape:?}")),
+        };
+        let quant = Some((group_size, bits));
+        let pos = crate::vision::weights::load_dense_param(weights, &pos_key, &expected, quant)?;
         let pos_embed = mlxcel_core::reshape(&pos, &[g, g, c]);
 
         let cls_key = format!("{prefix}.cls_token");
-        let cls_token = require(weights, &cls_key)?;
+        let cls_token = crate::vision::weights::load_dense_param(
+            weights,
+            &cls_key,
+            &[config.num_prefix_tokens(), c],
+            quant,
+        )?;
         let prefix_tokens = config.num_prefix_tokens();
         if mlxcel_core::array_shape(&cls_token) != [prefix_tokens, c] {
             return Err(format!(
@@ -288,7 +343,7 @@ impl RadioVisionTower {
         }
 
         let dtype = mlxcel_core::array_dtype(&cls_token);
-        let mut blocks = Vec::with_capacity(config.num_layers);
+        let mut blocks = Vec::with_capacity(config.num_layers.min(weights.len()));
         for i in 0..config.num_layers {
             blocks.push(RadioBlock::from_weights(
                 weights,
@@ -311,6 +366,14 @@ impl RadioVisionTower {
     /// Run the tower over normalized `[B, 3, H, W]` pixels. `H` and `W` must
     /// be multiples of the patch size (the processor pads to one).
     pub(crate) fn forward(&self, pixels: &MlxArray) -> Result<RadioOutput, String> {
+        self.forward_page(pixels, None)
+    }
+
+    pub(crate) fn forward_page(
+        &self,
+        pixels: &MlxArray,
+        content: Option<(i32, i32)>,
+    ) -> Result<RadioOutput, String> {
         let s = mlxcel_core::array_shape(pixels);
         let [b, 3, h, w] = s.as_slice() else {
             return Err(format!(
@@ -324,12 +387,30 @@ impl RadioVisionTower {
                 "Nemotron-Parse input {h}x{w} is not a multiple of the patch size {p}"
             ));
         }
+        if content.is_some() && (b != 1 || w % 64 != 0) {
+            return Err(format!(
+                "Nemotron 3.5 Parse needs one page with width divisible by 64, got {s:?}"
+            ));
+        }
         let (hp, wp) = (h / p, w / p);
         let c = self.config.hidden_size;
 
         let pixels = mlxcel_core::astype(pixels, self.dtype);
         let x = self.patch_embed.forward(&patchify(&pixels, p));
-        let pos = pos_embed_for_grid(&self.pos_embed, hp, wp);
+        let pos = match content {
+            Some((h, w)) => {
+                let sampled =
+                    crate::models::nemotron_parse_v35::positions::content_normalized_pos_embed(
+                        &self.pos_embed,
+                        hp,
+                        wp,
+                        h,
+                        w,
+                    )?;
+                mlxcel_core::astype(&sampled, mlxcel_core::array_dtype(&x))
+            }
+            None => pos_embed_for_grid(&self.pos_embed, hp, wp),
+        };
         let x = mlxcel_core::add(&x, &mlxcel_core::expand_dims(&pos, 0));
 
         let prefix = self.config.num_prefix_tokens();

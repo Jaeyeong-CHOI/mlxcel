@@ -1270,6 +1270,11 @@ pub(crate) fn detect_model_type_with_probes<P: ModelDetectionProbes + ?Sized>(
         "molmo_point" => Ok(ModelType::MolmoPointVLM),
         // Florence-2 (DaViT tower + BART encoder-decoder text stack).
         "florence2" => Ok(ModelType::Florence2VLM),
+        // 3.5 uses a causal visual prefix in both raw and converted checkpoints.
+        "nemotron_parse_v3_5" => Ok(ModelType::NemotronParseV35VLM),
+        "nemotron_parse" if super::nemotron_parse_v35::config::is_prefix_decoder(v) => {
+            Ok(ModelType::NemotronParseV35VLM)
+        }
         // Nemotron-Parse (C-RADIO ViT-H encoder + pre-norm mBART decoder).
         "nemotron_parse" => Ok(ModelType::NemotronParseVLM),
         // Speech-to-text (encoder-decoder ASR).

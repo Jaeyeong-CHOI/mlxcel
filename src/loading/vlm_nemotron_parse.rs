@@ -30,3 +30,21 @@ pub(crate) fn load_nemotron_parse_vlm(model_path: &Path) -> Result<LoadedModel> 
     let model = models::NemotronParseVlmModel::load(model_path)?;
     Ok(LoadedModel::NemotronParseVLM(model))
 }
+
+pub(crate) fn load_nemotron_parse_v35(model_path: &Path) -> Result<LoadedModel> {
+    let (_, v) = super::read_sanitized_vlm_config(model_path)?;
+    let c = models::nemotron_parse_v35::config::NemotronParseV35Config::parse(&v)?;
+    let processor = models::nemotron_parse::NemotronParseImageProcessor::from_pretrained(
+        model_path,
+        (2048, 1664),
+    )?;
+    anyhow::ensure!(
+        processor.final_size.0 <= 2048 && processor.final_size.1 <= 1664,
+        "Nemotron 3.5 Parse processor exceeds 2048x1664"
+    );
+    let w = super::load_vlm_weights_common(model_path, None)?;
+    let w = models::nemotron_parse::checkpoint::canonicalize_prefix_decoder(w);
+    let model = crate::vision::NemotronParseV35VlModel::load(&w, c, processor)
+        .map_err(anyhow::Error::msg)?;
+    Ok(LoadedModel::NemotronParseV35VLM(model))
+}

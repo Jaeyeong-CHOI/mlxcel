@@ -484,6 +484,7 @@ impl ChatTemplateProcessor {
             family,
             Some(
                 crate::models::ModelType::NemotronParseVLM
+                    | crate::models::ModelType::NemotronParseV35VLM
                     | crate::models::ModelType::UnlimitedOcrVLM
             )
         ) {
@@ -2348,7 +2349,8 @@ fn builtin_chat_template(family: Option<crate::models::ModelType>) -> Option<&'s
         crate::models::ModelType::Florence2VLM => Some(FLORENCE2_CHAT_TEMPLATE),
         // Same text-verbatim contract: the rendered text is the task prompt
         // that seeds the decoder, and the page travels out-of-band.
-        crate::models::ModelType::NemotronParseVLM => Some(FLORENCE2_CHAT_TEMPLATE),
+        crate::models::ModelType::NemotronParseVLM
+        | crate::models::ModelType::NemotronParseV35VLM => Some(FLORENCE2_CHAT_TEMPLATE),
         crate::models::ModelType::GotOcrVLM => Some(GOT_OCR_CHAT_TEMPLATE),
         crate::models::ModelType::Plamo2VLM => Some(PLAMO2_VL_CHAT_TEMPLATE),
         crate::models::ModelType::UnlimitedOcrVLM => Some(UNLIMITED_OCR_CHAT_TEMPLATE),

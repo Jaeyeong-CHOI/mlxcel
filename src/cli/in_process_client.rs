@@ -105,6 +105,7 @@ pub struct CliServerSettings {
     pub top_n_sigma: f32,
     pub p_less: bool,
     pub repeat_penalty: f32,
+    pub repeat_penalty_was_set: bool,
     /// `--repeat-last-n` when given (`-1` = full history); the server default
     /// window (64) otherwise.
     pub repeat_last_n: Option<i32>,
@@ -146,6 +147,7 @@ impl Default for CliServerSettings {
             top_n_sigma: 0.0,
             p_less: false,
             repeat_penalty: 1.0,
+            repeat_penalty_was_set: false,
             repeat_last_n: None,
             dry_multiplier: 0.0,
             dry_base: 1.75,
@@ -193,6 +195,8 @@ impl CliServerSettings {
             top_n_sigma: self.top_n_sigma,
             seed: self.seed,
             repeat_penalty: self.repeat_penalty,
+            repeat_penalty_was_set: self.repeat_penalty_was_set,
+            repeat_last_n_was_set: self.repeat_last_n.is_some(),
             dry_multiplier: self.dry_multiplier,
             dry_base: self.dry_base,
             dry_allowed_length: self.dry_allowed_length,

@@ -235,7 +235,8 @@ fn validate_param(
 /// `None` after their shape is validated.
 ///
 /// Used by: GLM-4V, Hunyuan-VL, Phi4-SigLIP, DeepSeek-OCR CLIP,
-/// Learnable2DInterpPosEmb (LFM2-VL/Kimi-VL), and SAM3 prompt embeddings.
+/// Learnable2DInterpPosEmb (LFM2-VL/Kimi-VL), SAM3 prompt embeddings, the shared
+/// Parse 2.0/3.5 RADIO tower and neck, and the Parse 3.5 decoder.
 pub(crate) fn resolve_param_quantization(
     weights: &WeightMap,
     key: &str,
@@ -253,7 +254,8 @@ pub(crate) fn resolve_param_quantization(
 /// MolmoPoint; Jina-VLM; InternVL; DeepSeek-VL2 and DeepSeek-OCR; Moondream;
 /// MoonViT3D; Nemotron-H Nano Omni; Idefics2; Hunyuan-VL framing; Granite and
 /// Granite4 Vision; DINOv2; RF-DETR; SAM3, SAM3.1 and SAM3D Body; Inkling 2;
-/// and the shared Molmo/Jina text embedding loader.
+/// the shared Molmo/Jina text embedding loader; the Parse 2.0/3.5 RADIO tower
+/// and neck; and the Parse 3.5 decoder layer norms.
 pub(crate) fn load_dense_param(
     weights: &WeightMap,
     key: &str,

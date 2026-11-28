@@ -1271,6 +1271,7 @@ fn inspect_registry_id(model_type: ModelType) -> &'static str {
         ModelType::LlmJpVLM => "llmjp_vlm",
         ModelType::MageVLM => "mage_vlm",
         ModelType::GotOcrVLM => "got_ocr_vlm",
+        ModelType::NemotronParseV35VLM => "nemotron_parse_v3_5",
         ModelType::LocateAnythingVLM => "locateanything_vlm",
         ModelType::SmolVLM => "smolvlm",
         ModelType::Idefics2 => "idefics2",

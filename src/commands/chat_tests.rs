@@ -154,6 +154,14 @@ fn non_chat_families_are_refused_before_loading() {
     .expect("config");
     let err = non_chat_family_error(dir.path()).expect("Florence-2 has no chat surface");
     assert!(err.to_string().contains("image-task model"), "{err}");
+    std::fs::write(
+        dir.path().join("config.json"),
+        r#"{"model_type": "nemotron_parse_v3_5"}"#,
+    )
+    .expect("config");
+    let err = non_chat_family_error(dir.path()).expect("3.5 Parse has no chat surface");
+    assert!(err.to_string().contains("mlxcel generate"), "{err}");
+    assert!(err.to_string().contains("<predict_text_in_pic>"), "{err}");
     std::fs::write(dir.path().join("config.json"), r#"{"model_type": "llama"}"#).expect("config");
     assert!(non_chat_family_error(dir.path()).is_none());
 }

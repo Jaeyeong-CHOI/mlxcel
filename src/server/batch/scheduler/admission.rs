@@ -340,6 +340,7 @@ impl BatchScheduler {
         let prepared_early = if vlm_sharing_ok {
             match prepare_request_vlm_embeddings(
                 self.engine.model(),
+                &mut sampling.visual_prefix_len,
                 &self.tokenizer,
                 &prompt,
                 &mut prompt_tokens,
@@ -463,6 +464,7 @@ impl BatchScheduler {
             }
             None => match prepare_request_vlm_embeddings(
                 self.engine.model(),
+                &mut sampling.visual_prefix_len,
                 &self.tokenizer,
                 &prompt,
                 &mut prompt_tokens,
@@ -493,6 +495,25 @@ impl BatchScheduler {
                 }
             },
         };
+
+        // The unsigned server default represents full history with i32::MAX.
+        // Once a visual-prefix request is bounded, use the sampler's incremental
+        // full-history path instead of sorting the entire OCR output on each step.
+        if sampling.visual_prefix_len > 0 && sampling.penalty_last_n == i32::MAX {
+            sampling.penalty_last_n = -1;
+        }
+
+        if let Err(err) = self
+            .engine
+            .model()
+            .validate_generation_length(prompt_tokens.len(), options.max_tokens)
+        {
+            self.prompt_cache_seq_ctx.remove(&seq_id);
+            self.release_sequence_caches(seq_id);
+            self.engine.model().clear_vlm_fallback_state();
+            let _ = response_tx.send(GenerateEvent::Error(err.to_string()));
+            return;
+        }
 
         // mlx-vlm PR #1095: per-sequence MRoPE alignment.
         //

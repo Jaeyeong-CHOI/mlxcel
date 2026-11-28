@@ -178,6 +178,9 @@ pub fn resolve_inkling_audio_token_ids(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VlmPreparationSummary {
+    VisualPrefix {
+        prefix_len: usize,
+    },
     QwenVlm {
         image_blocks: usize,
         video_blocks: usize,
@@ -2183,6 +2186,25 @@ where
                     total_image_tokens: stats.total_image_tokens,
                     total_tokens: prompt_tokens.len(),
                     pre_templated: stats.pre_templated,
+                }),
+            }))
+        }
+        VlmRuntimeRef::NemotronParseV35(model) => {
+            let [page] = images else {
+                anyhow::bail!("Nemotron 3.5 Parse requires one page image")
+            };
+            let control = if prompt.is_empty() {
+                "</s><s><predict_bbox><predict_classes><output_markdown><predict_text_in_pic>"
+            } else {
+                prompt
+            };
+            *prompt_tokens = encode(control, false);
+            let text_len = prompt_tokens.len();
+            let embeddings = model.prepare(prompt_tokens, page)?;
+            Ok(Some(PreparedVlmEmbeddings {
+                embeddings,
+                preparation: Some(VlmPreparationSummary::VisualPrefix {
+                    prefix_len: prompt_tokens.len() - text_len,
                 }),
             }))
         }

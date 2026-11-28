@@ -3610,6 +3610,7 @@ fn frames_fallback_support() -> ModelMediaSupport {
         video_native: false,
         video_frames_fallback: true,
         video_with_audio: false,
+        single_page_required: false,
         audio_refusal: None,
     }
 }
@@ -3622,6 +3623,7 @@ fn native_video_support() -> ModelMediaSupport {
         video_native: true,
         video_frames_fallback: false,
         video_with_audio: false,
+        single_page_required: false,
         audio_refusal: None,
     }
 }

@@ -176,7 +176,7 @@ pub(crate) use muse_glimmer::{
     normalize_muse_glimmer_weights,
 };
 pub(crate) use nemotron_h_nano_omni::load_nemotron_h_nano_omni_vlm;
-pub(crate) use nemotron_parse::load_nemotron_parse_vlm;
+pub(crate) use nemotron_parse::{load_nemotron_parse_v35, load_nemotron_parse_vlm};
 pub(crate) use paddleocr::load_paddleocr_vl;
 pub(crate) use pixtral::{load_mistral3_vlm, load_pixtral_vlm};
 pub(crate) use plamo2_vl::load_plamo2_vl;
@@ -215,7 +215,7 @@ pub(crate) use step3p7::load_step3p7_vl;
 pub(crate) use youtu_vl_loader::load_youtu_vl_iree_host_preprocessor;
 pub(crate) use youtu_vl_loader::load_youtu_vl_vlm;
 
-fn read_sanitized_vlm_config(model_path: &Path) -> Result<(String, Value)> {
+pub(super) fn read_sanitized_vlm_config(model_path: &Path) -> Result<(String, Value)> {
     let config_path = model_path.join("config.json");
     let config_str = std::fs::read_to_string(&config_path)
         .map_err(|e| anyhow::anyhow!("Failed to read config.json: {}", e))?;

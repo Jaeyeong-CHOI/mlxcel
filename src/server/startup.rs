@@ -344,6 +344,8 @@ pub struct ServerStartupConfig {
     pub seed: Option<u64>,
     pub repeat_last_n: usize,
     pub repeat_penalty: f32,
+    pub repeat_penalty_was_set: bool,
+    pub repeat_last_n_was_set: bool,
     pub presence_penalty: f32,
     /// `--presence-penalty` was passed; otherwise `generation_config.json`'s
     /// value, when present, is the server default (issue #3457).
@@ -818,6 +820,8 @@ impl Default for ServerStartupConfig {
             seed: None,
             repeat_last_n: 64,
             repeat_penalty: 1.0,
+            repeat_last_n_was_set: false,
+            repeat_penalty_was_set: false,
             presence_penalty: 0.0,
             presence_penalty_was_set: false,
             frequency_penalty: 0.0,
@@ -1380,8 +1384,12 @@ pub(crate) fn detect_model_media_support(model_path: &Path) -> ModelMediaSupport
     // the clip on the HTTP boundary alone would leave the two fronts
     // disagreeing about the same checkpoint. Lift both guards together when
     // the family is qualified for multi-image prompts.
-    let video_frames_fallback =
-        multimodal && !video_native && !matches!(model_type, ModelType::MuseGlimmerVLM);
+    let video_frames_fallback = multimodal
+        && !video_native
+        && !matches!(
+            model_type,
+            ModelType::MuseGlimmerVLM | ModelType::NemotronParseV35VLM
+        );
     if video_frames_fallback {
         tracing::info!(
             "model_type={:?}: no native video path; video_url content blocks will be served as \
@@ -1399,7 +1407,8 @@ pub(crate) fn detect_model_media_support(model_path: &Path) -> ModelMediaSupport
 
     ModelMediaSupport {
         image: multimodal,
-        audio: multimodal && !no_audio_encoder,
+        single_page_required: model_type == ModelType::NemotronParseV35VLM,
+        audio: multimodal && !no_audio_encoder && model_type != ModelType::NemotronParseV35VLM,
         video_native,
         video_frames_fallback,
         video_with_audio,
@@ -1991,13 +2000,11 @@ pub(super) fn build_server_config(
         default_xtc_threshold: startup.xtc_threshold,
         default_ignore_eos: startup.ignore_eos,
         default_stop_sequences: startup.reverse_prompt.clone(),
-        default_repetition_penalty: startup.repeat_penalty,
-        default_repetition_context_size: startup.repeat_last_n,
-        default_max_tokens: resolve_default_max_tokens(
-            startup.n_predict,
-            context_size,
-            &startup.model_path,
-        ),
+        default_repetition_penalty: sampling_defaults.repeat_penalty,
+        default_repetition_context_size: sampling_defaults.repeat_last_n,
+        default_max_tokens: sampling_defaults.max_new_tokens.unwrap_or_else(|| {
+            resolve_default_max_tokens(startup.n_predict, context_size, &startup.model_path)
+        }),
         default_seed: startup.seed,
         default_frequency_penalty: startup.frequency_penalty,
         default_presence_penalty: sampling_defaults.presence_penalty,
@@ -2154,6 +2161,9 @@ pub(super) struct ResolvedGenerationSamplingDefaults {
     pub top_p: f32,
     pub top_k: i32,
     pub presence_penalty: f32,
+    pub repeat_penalty: f32,
+    pub repeat_last_n: usize,
+    pub max_new_tokens: Option<usize>,
 }
 
 pub(super) fn resolve_generation_sampling_defaults(
@@ -2176,6 +2186,22 @@ pub(super) fn resolve_generation_sampling_defaults(
         } else {
             config_defaults.top_k.unwrap_or(startup.top_k)
         },
+        repeat_penalty: if startup.repeat_penalty_was_set {
+            startup.repeat_penalty
+        } else {
+            config_defaults
+                .repetition_penalty
+                .unwrap_or(startup.repeat_penalty)
+        },
+        repeat_last_n: if config_defaults.full_repetition_history && !startup.repeat_last_n_was_set
+        {
+            i32::MAX as usize
+        } else {
+            startup.repeat_last_n
+        },
+        max_new_tokens: config_defaults
+            .max_new_tokens
+            .filter(|_| startup.n_predict < 0),
         presence_penalty: resolve_presence_penalty_default(
             startup,
             config_defaults.presence_penalty,
@@ -2296,12 +2322,9 @@ pub(crate) fn startup_warmup_skip_reason(
         ModelType::NemotronVoiceChat => {
             Some("Skipping text warmup for Nemotron VoiceChat (served on /v1/realtime)")
         }
-        // Florence-2 (issue #1073) and Nemotron-Parse (issue #1369) run on
-        // their seq2seq workers, which reject anything but a task marker with
-        // exactly one image, so the text literal "Hello" would only log a
-        // spurious failure. They warm on their first real request instead.
-        ModelType::Florence2VLM | ModelType::NemotronParseVLM => {
-            Some("Skipping text warmup for image-task seq2seq model (Florence-2 / Nemotron-Parse)")
+        // These tasks need an image, so their first page request warms the model.
+        ModelType::Florence2VLM | ModelType::NemotronParseVLM | ModelType::NemotronParseV35VLM => {
+            Some("Skipping text warmup for an image-task model that requires a page or image")
         }
         _ => None,
     }

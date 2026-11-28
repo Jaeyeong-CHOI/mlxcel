@@ -1455,6 +1455,9 @@ pub struct SamplingConfig {
     /// over only the last `N` generated tokens, matching b10621's windowed
     /// penalty ring buffer. DRY has its own window (`dry_penalty_last_n`).
     pub penalty_last_n: i32,
+    /// Leading visual embeddings in the expanded prompt. They have KV positions
+    /// but no text token in the reference model's sampling history.
+    pub visual_prefix_len: usize,
     /// Mirostat mode, b10621's `--mirostat` (#1485): `0` disables (the
     /// default), `1` selects Mirostat, `2` selects Mirostat 2.0. A non-zero
     /// value REPLACES the whole sampler chain, exactly as b10621's
@@ -1547,6 +1550,7 @@ impl Default for SamplingConfig {
             p_less: false,
             typical_p: 1.0,
             penalty_last_n: -1,
+            visual_prefix_len: 0,
             mirostat: 0,
             mirostat_tau: 5.0,
             mirostat_eta: 0.1,
@@ -1587,6 +1591,7 @@ impl SamplingConfig {
             p_less: false,
             typical_p: 1.0,
             penalty_last_n: -1,
+            visual_prefix_len: 0,
             mirostat: 0,
             mirostat_tau: 5.0,
             mirostat_eta: 0.1,

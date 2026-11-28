@@ -763,6 +763,10 @@ fn preprocess_penalty_stages(
     //   -inf × k == -inf,  -inf + f == -inf.
     let last_logits = apply_token_bias_stage(last_logits, config);
 
+    // Keep the complete text history, including an actual pad token in the
+    // text. The recorded span is request-local and independent of token values.
+    let token_history = &token_history[config.visual_prefix_len.min(token_history.len())..];
+
     // Synchronize the incremental state to the current history once, before any
     // penalty reads it. No-op when `state` is `None`.
     if let Some(s) = &mut state {
@@ -6542,6 +6546,25 @@ mod tests {
         );
         assert!(!cfg.needs_token_history());
         assert!(config_supports_fused_batch(&cfg));
+    }
+
+    #[test]
+    fn nemotron_parse_visual_prefix_excludes_only_image_positions_from_penalties() {
+        let logits = ffi::from_slice_f32(&[2.0, 2.0, 2.0, 2.0], &[1, 1, 4]);
+        let sampling = SamplingConfig {
+            repetition_penalty: 2.0,
+            visual_prefix_len: 3,
+            ..SamplingConfig::greedy()
+        };
+        // The first three pad IDs stand for visual rows. The second request
+        // also has a genuine pad ID after the end of its visual span.
+        for (history, expected) in [
+            (&[1, 1, 1, 2, 3][..], [2.0, 2.0, 1.0, 1.0]),
+            (&[1, 1, 1, 1, 2, 3][..], [2.0, 1.0, 1.0, 1.0]),
+        ] {
+            let (_, adjusted) = sample_token_optimized(&logits, &sampling, history);
+            assert_eq!(to_vec_f32(&adjusted), expected);
+        }
     }
 
     #[test]

@@ -199,6 +199,7 @@ const EXPECTED_PER_ROW_FALLBACK: &[&str] = &[
     "HyV4Model@src/models/hy_v4.rs",
     "Llama4CxxModel@src/models/llama4.rs",
     "MuseGlimmerTextWrapper@src/models/muse_glimmer.rs",
+    "NemotronParseV35VlModel@src/vision/nemotron_parse_v35.rs",
     "PipelineServerModel@src/distributed/pipeline/server_runtime.rs",
     "Qwen4ExpModel@src/models/qwen4_exp.rs",
     "TensorParallelGemma4Model@src/distributed/tensor_parallel/llama_runtime.rs",

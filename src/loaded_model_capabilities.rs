@@ -62,6 +62,8 @@ pub enum VlmRuntimeRef<'a> {
     LlmJpVl(&'a vision::LlmJpVlModel),
     /// GOT-OCR 2.0 (GOT) runtime (SAM ViT-B + linear projector + Qwen2-0.5B).
     GotOcr(&'a vision::GotOcrVlModel),
+    /// Nemotron 3.5 Parse (C-RADIOv4 visual prefix and causal GQA decoder).
+    NemotronParseV35(&'a vision::NemotronParseV35VlModel),
     /// Mage-VL (mage_vl) runtime (Mage-ViT + 2x2 merger + plain Qwen3).
     MageVl(&'a vision::MageVlModel),
     /// Kimi-VL / Kimi-VL 2.5 (MoonViT) runtime.
@@ -167,6 +169,24 @@ pub(crate) fn image_token_block_info_from_runtime(
 }
 
 impl LoadedModel {
+    /// Validate a hard architecture limit against the expanded multimodal
+    /// sequence, before handing it to the autoregressive engine.
+    pub fn validate_generation_length(
+        &self,
+        prompt: usize,
+        generated: usize,
+    ) -> anyhow::Result<()> {
+        if let Self::NemotronParseV35VLM(model) = self {
+            let total = prompt.saturating_add(generated);
+            anyhow::ensure!(
+                total <= model.context_limit(),
+                "Nemotron 3.5 Parse prefix plus text length {total} exceeds {}",
+                model.context_limit()
+            );
+        }
+        Ok(())
+    }
+
     /// Check if this model is a vision-language model.
     pub fn is_vlm(&self) -> bool {
         self.vlm_runtime().is_some()
@@ -261,6 +281,7 @@ impl LoadedModel {
             Self::InternVLChatVLM(model) => Some(VlmRuntimeRef::InternVL(model)),
             Self::LlmJpVL(model) => Some(VlmRuntimeRef::LlmJpVl(model)),
             Self::GotOcrVLM(model) => Some(VlmRuntimeRef::GotOcr(model)),
+            Self::NemotronParseV35VLM(model) => Some(VlmRuntimeRef::NemotronParseV35(model)),
             Self::MageVLM(model) => Some(VlmRuntimeRef::MageVl(model)),
             Self::KimiVL(model) => Some(VlmRuntimeRef::KimiVL(model)),
             Self::KimiK3VLM(model) => Some(VlmRuntimeRef::KimiK3(model)),

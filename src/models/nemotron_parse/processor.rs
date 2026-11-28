@@ -18,7 +18,11 @@
 //! 2048x1664 with the aspect ratio kept, centre-padded with white to exactly
 //! that size, scaled to `[0, 1]`, and normalized with the CLIP mean/std.
 //!
-//! Resizing uses bilinear (`FilterType::Triangle`) filtering. PIL's BILINEAR
+//! The 3.5 processor derives from NVIDIA mlx-vlm processing_nemotron_parse_v3_5.py
+//! (OpenMDW-1.1). It uses PIL-compatible bilinear resizing and pads only the
+//! bottom and right to patch multiples.
+//!
+//! For 2.0, resizing uses bilinear (`FilterType::Triangle`) filtering. PIL's BILINEAR
 //! downscale uses a slightly different antialias tap set, so a page that has
 //! to be shrunk is close to, not bit-identical with, the reference; a page
 //! already inside the target box only pads, which is exact.
@@ -157,10 +161,50 @@ impl NemotronParseImageProcessor {
         } else {
             rgb
         };
-        let (th, tw) = self.final_size;
+        self.padded_pixels(&rgb, self.final_size, true)
+    }
+
+    pub(crate) fn packed_geometry(&self, w: u32, h: u32) -> Result<(u32, u32, u32, u32)> {
+        anyhow::ensure!(
+            w > 0 && h > 0,
+            "Nemotron 3.5 Parse page dimensions must be positive"
+        );
+        let (cw, ch) = self.resized_size(w, h);
+        let (ph, pw) = (ch.next_multiple_of(16), cw.next_multiple_of(64));
+        anyhow::ensure!(
+            ph <= 2048 && pw <= 1664,
+            "Nemotron 3.5 Parse page exceeds 2048x1664"
+        );
+        Ok((ch, cw, ph, pw))
+    }
+
+    pub(crate) fn packed_pixels(
+        &self,
+        image: &DynamicImage,
+        content: (u32, u32),
+        canvas: (u32, u32),
+    ) -> Result<Vec<f32>> {
+        use crate::vision::dense::preprocess::{PillowResizeFilter, resize_pillow_rgb8};
+        let rgb = image.to_rgb8();
+        let resized = if rgb.dimensions() == (content.1, content.0) {
+            rgb
+        } else {
+            resize_pillow_rgb8(&rgb, content.1, content.0, PillowResizeFilter::Bilinear)?
+        };
+        Ok(self.padded_pixels(&resized, canvas, false).0)
+    }
+
+    fn padded_pixels(
+        &self,
+        rgb: &image::RgbImage,
+        size: (u32, u32),
+        center: bool,
+    ) -> (Vec<f32>, u32, u32) {
+        let (nw, nh) = rgb.dimensions();
+        let (th, tw) = size;
         let (ch, cw) = (nh.min(th), nw.min(tw));
-        let pad_top = (th - ch) / 2;
-        let pad_left = (tw - cw) / 2;
+        let pad_top = if center { (th - ch) / 2 } else { 0 };
+        let pad_left = if center { (tw - cw) / 2 } else { 0 };
 
         let plane = (th * tw) as usize;
         let mut data = vec![0.0f32; 3 * plane];

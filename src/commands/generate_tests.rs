@@ -870,6 +870,7 @@ fn cli_sampling_explicit_flags_override_generation_config_per_key() {
             temperature: true,
             top_p: true,
             top_k: true,
+            ..Default::default()
         },
     );
 

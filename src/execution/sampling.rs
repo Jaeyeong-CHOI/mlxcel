@@ -164,6 +164,7 @@ pub fn build_sampling_config(params: ResolvedSamplingParams) -> SamplingConfig {
             adaptive_target: params.adaptive_target,
             adaptive_decay: params.adaptive_decay,
             min_keep: params.min_keep,
+            visual_prefix_len: 0,
             // Derived from breaker strings against the vocabulary at
             // enqueue time (#1485); empty here.
             dry_breaker_heads: std::sync::Arc::new(std::collections::HashMap::new()),

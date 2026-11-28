@@ -1280,6 +1280,7 @@ mod tests {
             video_native: true,
             video_frames_fallback: false,
             video_with_audio: false,
+            single_page_required: false,
             audio_refusal: None,
         };
         let request = chat_request_with_media_parts(serde_json::json!([
@@ -1310,6 +1311,7 @@ mod tests {
             video_native: true,
             video_frames_fallback: false,
             video_with_audio: false,
+            single_page_required: false,
             audio_refusal: None,
         };
         let request = chat_request_with_media_parts(serde_json::json!([

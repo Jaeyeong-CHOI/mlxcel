@@ -300,6 +300,9 @@ pub struct SerializableSamplingState {
     /// default, which would DISABLE the penalties it was applying.
     #[serde(default = "default_penalty_last_n_full")]
     pub penalty_last_n: i32,
+    /// Image-only positions at the start of this request. Older peers use the complete history.
+    #[serde(default)]
+    pub visual_prefix_len: usize,
     pub stop_token_ids: Vec<i32>,
     /// Mirostat mode (#1485). `#[serde(default)]` (`0` disabled) resolves an
     /// older peer's frame to the pre-#1485 chain.

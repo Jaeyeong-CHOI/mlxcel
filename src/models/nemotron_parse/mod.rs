@@ -30,12 +30,12 @@
 //! `hf_nemotron_parse_modeling.py`, `hf_nemotron_parse_processor.py`, and
 //! the C-RADIO code in `nvidia/C-RADIOv2-H`.
 
-mod checkpoint;
+pub(crate) mod checkpoint;
 mod config;
 mod decoder;
-mod encoder;
+pub(crate) mod encoder;
 mod model;
-mod neck;
+pub(crate) mod neck;
 mod processor;
 mod runtime;
 

@@ -42,6 +42,7 @@ fn inkling2_support() -> ModelMediaSupport {
         image: true,
         audio: false,
         video_frames_fallback: true,
+        single_page_required: false,
         audio_refusal: Some(INKLING2_AUDIO_REFUSAL),
         ..ModelMediaSupport::default()
     }

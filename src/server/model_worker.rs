@@ -1734,6 +1734,7 @@ pub(crate) fn vision_cache_keys(
 /// its own fixed adjacent-pair sampling.
 pub(crate) fn prepare_request_vlm_embeddings(
     model: &LoadedModel,
+    visual_prefix_len: &mut usize,
     tokenizer: &MlxcelTokenizer,
     prompt: &str,
     prompt_tokens: &mut Vec<i32>,
@@ -1746,6 +1747,9 @@ pub(crate) fn prepare_request_vlm_embeddings(
     cancelled: &AtomicBool,
     observability: &BatchObservability,
 ) -> Result<Option<InputEmbeddings>> {
+    if matches!(model, LoadedModel::NemotronParseV35VLM(_)) && images.len() != 1 {
+        anyhow::bail!("Nemotron 3.5 Parse requires one page image");
+    }
     let has_media = !images.is_empty() || !audio.is_empty() || !videos.is_empty();
 
     if !audio.is_empty() && !model.supports_audio_input() {
@@ -2008,7 +2012,14 @@ pub(crate) fn prepare_request_vlm_embeddings(
                 },
             )?
         };
-        return Ok(prepared.map(|prepared| prepared.embeddings));
+        return Ok(prepared.map(|prepared| {
+            if let Some(crate::vlm_runtime::VlmPreparationSummary::VisualPrefix { prefix_len }) =
+                prepared.preparation
+            {
+                *visual_prefix_len = prefix_len;
+            }
+            prepared.embeddings
+        }));
     }
 
     // If we reach here with no images (audio was present but unsupported),

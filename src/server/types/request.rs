@@ -532,33 +532,29 @@ impl MessageContent {
         }
     }
 
-    /// Extract image data URIs/paths from multimodal content
+    /// Borrow image parts so cardinality checks need not copy base64 payloads.
+    pub(crate) fn iter_image_parts(&self) -> impl Iterator<Item = &ImageUrl> {
+        let parts = match self {
+            Self::Text(_) => &[][..],
+            Self::Parts(parts) => parts.as_slice(),
+        };
+        parts.iter().filter_map(|part| match part {
+            ContentPart::ImageUrl { image_url } => Some(image_url),
+            _ => None,
+        })
+    }
+
+    /// Extract image data URIs/paths from multimodal content.
     pub fn image_urls(&self) -> Vec<String> {
-        match self {
-            MessageContent::Text(_) => Vec::new(),
-            MessageContent::Parts(parts) => parts
-                .iter()
-                .filter_map(|p| match p {
-                    ContentPart::ImageUrl { image_url } => Some(image_url.url.clone()),
-                    _ => None,
-                })
-                .collect(),
-        }
+        self.iter_image_parts()
+            .map(|image| image.url.clone())
+            .collect()
     }
 
     /// Extract whole `image_url` content parts, preserving the per-part
     /// `detail` / `max_soft_tokens` fields that [`Self::image_urls`] drops.
     pub fn image_parts(&self) -> Vec<ImageUrl> {
-        match self {
-            MessageContent::Text(_) => Vec::new(),
-            MessageContent::Parts(parts) => parts
-                .iter()
-                .filter_map(|p| match p {
-                    ContentPart::ImageUrl { image_url } => Some(image_url.clone()),
-                    _ => None,
-                })
-                .collect(),
-        }
+        self.iter_image_parts().cloned().collect()
     }
 
     /// Extract audio input data from multimodal content

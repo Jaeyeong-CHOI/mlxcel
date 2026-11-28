@@ -296,6 +296,7 @@ pub mod nemotron;
 pub mod nemotron_h;
 pub mod nemotron_nas;
 pub mod nemotron_parse;
+pub mod nemotron_parse_v35;
 pub mod nemotron_voicechat;
 pub mod olmo;
 pub mod olmo2;
@@ -636,6 +637,8 @@ pub enum ModelType {
     /// neck + pre-norm mBART decoder. Encoder-decoder (seq2seq), served on
     /// the same dedicated paths as Florence-2.
     NemotronParseVLM,
+    /// Nemotron 3.5 Parse (C-RADIOv4 visual prefix and causal GQA decoder).
+    NemotronParseV35VLM,
     Gemma3n,    // Gemma 3n (text-only)
     Gemma3nVLM, // Gemma 3n VLM (MobileNetV5 + Gemma3n)
     Phi,        // Phi 1/2
@@ -951,6 +954,7 @@ pub const ALL_MODEL_TYPES: &[ModelType] = &[
     ModelType::Moondream2VLM,
     ModelType::Florence2VLM,
     ModelType::NemotronParseVLM,
+    ModelType::NemotronParseV35VLM,
     ModelType::Gemma3n,
     ModelType::Gemma3nVLM,
     ModelType::Phi,
@@ -1528,6 +1532,10 @@ impl ModelType {
                 "Florence-2 (DaViT + BART seq2seq, task prompts)",
                 "Other VLM",
             ),
+            ModelType::NemotronParseV35VLM => (
+                "Nemotron 3.5 Parse (C-RADIOv4 + causal GQA OCR)",
+                "Other VLM",
+            ),
             ModelType::NemotronParseVLM => (
                 "Nemotron-Parse (C-RADIO ViT-H + mBART seq2seq OCR)",
                 "Other VLM",
@@ -1662,6 +1670,7 @@ mod metadata_tests {
             Moondream2VLM,
             Florence2VLM,
             NemotronParseVLM,
+            NemotronParseV35VLM,
             Gemma3n,
             Gemma3nVLM,
             Phi,

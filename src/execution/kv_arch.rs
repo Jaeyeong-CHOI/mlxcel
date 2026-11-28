@@ -1866,6 +1866,20 @@ mod tests {
     }
 
     #[test]
+    fn nemotron_parse_v35_sizes_both_decoder_layouts() {
+        for (family, key) in [
+            ("nemotron_parse", "decoder"),
+            ("nemotron_parse_v3_5", "text_config"),
+        ] {
+            let cfg = json!({"model_type":family,"architectures":["RadioMBartPrefixForCausalLM"],
+                 key:{"d_model":32,"decoder_layers":2,"decoder_attention_heads":4,"self_attention_kv_heads":2}});
+            let e = est(&cfg, 1024);
+            assert_eq!(e.kind, KvArchKind::Standard);
+            assert_eq!(e.total_bytes, 2 * 2 * 2 * 8 * 1024 * FP16);
+        }
+    }
+
+    #[test]
     fn vlm_text_config_is_used() {
         let cfg = json!({
             "model_type": "some_vlm",

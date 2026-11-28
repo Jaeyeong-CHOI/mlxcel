@@ -27,7 +27,7 @@ use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 
 use super::config::NemotronParseVisionConfig;
-use super::encoder::{VISION_LN_EPS, dense_or_quantized, layer_norm_eps};
+use super::encoder::{VISION_LN_EPS, checked_linear, layer_norm_eps};
 
 pub(crate) struct NemotronParseNeck {
     conv1: UnifiedLinear,
@@ -61,17 +61,51 @@ impl NemotronParseNeck {
                 "Nemotron-Parse {conv2_key} has shape {shape:?}, expected [{dim}, 1, {kw}, {dim}]"
             ));
         }
-        let conv2 = mlxcel_core::reshape(conv2, &[dim, kw * dim]);
+        let window = kw
+            .checked_mul(dim)
+            .ok_or("RADIO neck window width overflow")?;
+        let summary_width = i32::try_from(config.summary_idxs.len())
+            .ok()
+            .and_then(|n| n.checked_mul(config.hidden_size))
+            .ok_or("RADIO neck summary width overflow")?;
+        let conv2 = mlxcel_core::reshape(conv2, &[dim, window]);
         // Transposed once at load so the forward is a plain matmul.
         let conv2 = mlxcel_core::transpose_axes(&conv2, &[1, 0]);
         let conv2 = mlxcel_core::copy(&conv2);
         Ok(Self {
-            conv1: dense_or_quantized(weights, &format!("{prefix}.conv1"), group_size, bits)?,
-            layer_norm1: layer_norm_eps(weights, &format!("{prefix}.layer_norm1"), VISION_LN_EPS)?,
+            conv1: checked_linear(
+                weights,
+                &format!("{prefix}.conv1"),
+                [dim, config.hidden_size],
+                group_size,
+                bits,
+            )?,
+            layer_norm1: layer_norm_eps(
+                weights,
+                &format!("{prefix}.layer_norm1"),
+                VISION_LN_EPS,
+                dim,
+            )?,
             conv2,
-            layer_norm2: layer_norm_eps(weights, &format!("{prefix}.layer_norm2"), VISION_LN_EPS)?,
-            sum_proj: dense_or_quantized(weights, &format!("{prefix}.sum_proj"), group_size, bits)?,
-            layer_norm3: layer_norm_eps(weights, &format!("{prefix}.layer_norm3"), VISION_LN_EPS)?,
+            layer_norm2: layer_norm_eps(
+                weights,
+                &format!("{prefix}.layer_norm2"),
+                VISION_LN_EPS,
+                dim,
+            )?,
+            sum_proj: checked_linear(
+                weights,
+                &format!("{prefix}.sum_proj"),
+                [dim, summary_width],
+                group_size,
+                bits,
+            )?,
+            layer_norm3: layer_norm_eps(
+                weights,
+                &format!("{prefix}.layer_norm3"),
+                VISION_LN_EPS,
+                dim,
+            )?,
             dim,
             kernel_w: kw,
         })

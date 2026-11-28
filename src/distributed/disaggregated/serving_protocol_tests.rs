@@ -260,6 +260,7 @@ fn sampling_round_trips_through_the_serializable_mirror() {
     config.typical_p = 0.5;
     config.p_less = true;
     config.penalty_last_n = 32;
+    config.visual_prefix_len = 7;
     config.token_bias.insert(41, 0.25);
     config.token_bias.insert(42, f32::NEG_INFINITY);
     config.token_bias.insert_byte_fragment(43, -0.5);
@@ -291,6 +292,7 @@ fn sampling_round_trips_through_the_serializable_mirror() {
     assert!(restored.p_less);
     assert_eq!(restored.typical_p, 0.5);
     assert_eq!(restored.penalty_last_n, 32);
+    assert_eq!(restored.visual_prefix_len, 7);
     assert_eq!(
         restored.token_bias.get(&41).copied().map(f32::to_bits),
         Some(0.25f32.to_bits())

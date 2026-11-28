@@ -38,6 +38,7 @@ fn default_sampling() -> SerializableSamplingState {
         typical_p: 1.0,
         p_less: false,
         penalty_last_n: -1,
+        visual_prefix_len: 0,
         stop_token_ids: Vec::new(),
         token_bias: Vec::new(),
         loop_detection: Default::default(),

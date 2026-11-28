@@ -117,11 +117,31 @@ fn conv2_to_mlx(w: &MlxArray) -> UniquePtr<MlxArray> {
 /// `vision_tower.*` / `language_model.*` layout, dropping tensors inference
 /// does not use and normalizing the two neck conv kernels.
 pub(crate) fn canonicalize_keys(weights: WeightMap) -> WeightMap {
+    canonicalize_with(weights, canonical_key)
+}
+
+/// Derived from NVIDIA mlx-vlm nemotron_parse_v3_5.Model.sanitize (OpenMDW-1.1).
+pub(crate) fn canonicalize_prefix_decoder(weights: WeightMap) -> WeightMap {
+    canonicalize_with(weights, |key| {
+        if key.starts_with("lm_head.")
+            || key.starts_with("decoder.extra_heads.")
+            || key.starts_with("decoder.extra_proj.")
+        {
+            None
+        } else if let Some(text) = key.strip_prefix("decoder.") {
+            Some(format!("language_model.{text}"))
+        } else {
+            canonical_key(key)
+        }
+    })
+}
+
+fn canonicalize_with(weights: WeightMap, rename: impl Fn(&str) -> Option<String>) -> WeightMap {
     let conv1_key = format!("{VISION_PREFIX}.neck.conv1.weight");
     let conv2_key = format!("{VISION_PREFIX}.neck.conv2.weight");
     let mut out = WeightMap::with_capacity(weights.len());
     for (key, value) in weights {
-        let Some(new_key) = canonical_key(&key) else {
+        let Some(new_key) = rename(&key) else {
             continue;
         };
         let value = if new_key == conv1_key {

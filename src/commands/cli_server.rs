@@ -72,6 +72,7 @@ pub(crate) fn settings_from_flags(
         top_n_sigma: sampling.top_n_sigma,
         p_less: sampling.p_less,
         repeat_penalty: sampling.repetition_penalty,
+        repeat_penalty_was_set: was_set("repetition-penalty", None),
         repeat_last_n: was_set("repeat-last-n", None).then_some(sampling.repeat_last_n),
         dry_multiplier: sampling.dry_multiplier,
         dry_base: sampling.dry_base,

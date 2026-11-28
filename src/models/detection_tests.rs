@@ -2662,3 +2662,16 @@ fn longcat_flash_sparse_is_detected_with_and_without_model_type() {
     assert!(err.to_string().contains("model_type"), "{err}");
     fs::remove_dir_all(model_dir).unwrap();
 }
+
+#[test]
+fn nemotron_parse_v35_raw_and_converted_detection() {
+    for config in [
+        r#"{"model_type":"nemotron_parse","architectures":["Other","RadioMBartPrefixForCausalLM"]}"#,
+        r#"{"model_type":"nemotron_parse_v3_5","text_config":{}}"#,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.json"), config).unwrap();
+        let family = super::detection::get_model_type(dir.path()).unwrap();
+        assert_eq!(format!("{family:?}"), "NemotronParseV35VLM");
+    }
+}

@@ -196,3 +196,33 @@ fn four_bit_checkpoint_reads_the_page() {
     eprintln!("4bit: {}", run.text);
     assert!(run.text.contains("Hello Nemotron"), "{}", run.text);
 }
+
+/// Exercise clap, default selection, visual expansion and the final budget together.
+#[test]
+#[ignore = "requires the NVIDIA Nemotron 3.5 Parse checkpoint"]
+fn nemotron_parse_v35_generate_unlimited_on_a_page() {
+    let Some(dir) = model_dir("Nemotron-3.5-Parse") else {
+        eprintln!("skipping: Nemotron 3.5 Parse checkpoint not found");
+        return;
+    };
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_mlxcel"))
+        .args(["generate", "-m"])
+        .arg(dir)
+        .args([
+            "--image",
+            FIXTURE,
+            "-n",
+            "-1",
+            "-p",
+            "</s><s><predict_bbox><predict_classes><output_markdown><predict_text_in_pic>",
+        ])
+        .output()
+        .expect("run mlxcel generate");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("<class_"), "{stdout}");
+}

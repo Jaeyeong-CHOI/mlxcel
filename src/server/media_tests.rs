@@ -1364,6 +1364,51 @@ fn media_capability_rejection_refuses_each_modality_a_checkpoint_cannot_consume(
 }
 
 #[test]
+fn nemotron_parse_v35_requires_exactly_one_page_across_messages() {
+    use crate::server::state::ModelMediaSupport;
+    let support = ModelMediaSupport {
+        image: true,
+        single_page_required: true,
+        ..ModelMediaSupport::none()
+    };
+    let mut request = build_chat_request(vec![ContentPart::Text {
+        text: "parse".into(),
+    }]);
+    let error = |r: &ChatCompletionRequest| super::media_capability_rejection(r, support, "parse");
+    assert_eq!(
+        error(&request).unwrap().status,
+        axum::http::StatusCode::BAD_REQUEST
+    );
+    let page = build_chat_request(vec![ContentPart::ImageUrl {
+        image_url: ImageUrl::new("page"),
+    }]);
+    assert!(error(&page).is_none());
+    request.messages[0].role = Role::System;
+    request.messages.extend(page.messages);
+    let refusal = error(&request).expect("system text would corrupt the page prompt");
+    assert_eq!(refusal.status, axum::http::StatusCode::BAD_REQUEST);
+    assert!(refusal.error.message.contains("single user message"));
+    request.messages[0].role = Role::User;
+    assert!(
+        error(&request).is_some(),
+        "multi-turn input must be refused"
+    );
+
+    let two_pages = build_chat_request(vec![
+        ContentPart::ImageUrl {
+            image_url: ImageUrl::new("a"),
+        },
+        ContentPart::ImageUrl {
+            image_url: ImageUrl::new("b"),
+        },
+    ]);
+    assert_eq!(
+        error(&two_pages).unwrap().status,
+        axum::http::StatusCode::BAD_REQUEST
+    );
+}
+
+#[test]
 fn media_capability_rejection_admits_what_the_checkpoint_supports() {
     use crate::server::state::ModelMediaSupport;
 
@@ -1373,6 +1418,7 @@ fn media_capability_rejection_admits_what_the_checkpoint_supports() {
         video_native: false,
         video_frames_fallback: false,
         video_with_audio: false,
+        single_page_required: false,
         audio_refusal: None,
     };
     let image_request = build_chat_request(vec![ContentPart::ImageUrl {
@@ -1402,7 +1448,7 @@ fn media_capability_rejection_admits_what_the_checkpoint_supports() {
         super::media_capability_rejection(&video_request, fallback, "gemma-3-4b-it-4bit").is_none()
     );
 
-    // A text-only request is never refused, whatever the checkpoint is.
+    // An ordinary VLM also serves a text-only request.
     let text = build_chat_request(vec![ContentPart::Text {
         text: "hello".to_string(),
     }]);
@@ -1440,6 +1486,7 @@ fn media_capability_rejection_refuses_video_plus_audio_unless_the_model_merges_b
         video_native: true,
         video_frames_fallback: false,
         video_with_audio: false,
+        single_page_required: false,
         audio_refusal: None,
     };
     let rejection =
@@ -1455,6 +1502,7 @@ fn media_capability_rejection_refuses_video_plus_audio_unless_the_model_merges_b
     // Gemma 4 Unified merges both, so the same request is admitted.
     let unified = ModelMediaSupport {
         video_with_audio: true,
+        single_page_required: false,
         audio_refusal: None,
         ..each_alone
     };
@@ -1480,6 +1528,7 @@ fn media_capability_rejection_leaves_single_modality_requests_alone() {
         video_native: true,
         video_frames_fallback: false,
         video_with_audio: false,
+        single_page_required: false,
         audio_refusal: None,
     };
     let audio_only = build_chat_request(vec![ContentPart::InputAudio {
@@ -1619,6 +1668,7 @@ fn inkling2_support() -> crate::server::state::ModelMediaSupport {
         image: true,
         audio: false,
         video_frames_fallback: true,
+        single_page_required: false,
         audio_refusal: Some(super::INKLING2_AUDIO_REFUSAL),
         ..Default::default()
     }

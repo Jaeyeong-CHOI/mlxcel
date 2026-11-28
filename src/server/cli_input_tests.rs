@@ -134,6 +134,8 @@ fn sample_input() -> ServerStartupInput {
         seed: 42,
         repeat_last_n: 64,
         repeat_penalty: 1.1,
+        repeat_penalty_was_set: true,
+        repeat_last_n_was_set: true,
         presence_penalty: 0.2,
         presence_penalty_was_set: true,
         frequency_penalty: 0.3,
