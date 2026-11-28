@@ -59,29 +59,35 @@ use mlxcel_core::{MlxArray, UniquePtr};
 use super::*;
 
 /// Locate a downloaded checkpoint that carries safetensors weights: the
-/// mlxcel store, then the HuggingFace cache, then `<repo>/models/<name>`.
-/// `None` skips the test.
-fn local_checkpoint(repo_id: &str) -> Option<PathBuf> {
+/// mlxcel store, then the HuggingFace cache, then `<repo>/models/<name>` for
+/// the repository basename and for each of `store_names` (the lowercase
+/// names the shared `models/` link farm uses, such as `qwen3-4b-bf16`).
+/// `None` skips the test, unless `MLXCEL_REQUIRE_MODELS` is set, which makes
+/// a missing checkpoint a failure instead of a silent pass.
+fn local_checkpoint(repo_id: &str, store_names: &[&str]) -> Option<PathBuf> {
     let has_weights = |dir: &PathBuf| {
         dir.join("config.json").is_file()
             && (dir.join("model.safetensors").is_file()
                 || dir.join("model.safetensors.index.json").is_file())
     };
+    let models = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models");
     let candidates = [
         crate::downloader::model_dir(repo_id),
         crate::downloader::hf_cache_snapshot(repo_id, None),
-        Some(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("models")
-                .join(crate::downloader::repo_basename(repo_id)),
-        ),
+        Some(models.join(crate::downloader::repo_basename(repo_id))),
     ];
-    let found = candidates.into_iter().flatten().find(has_weights);
+    let found = candidates
+        .into_iter()
+        .flatten()
+        .chain(store_names.iter().map(|name| models.join(name)))
+        .find(has_weights);
     if found.is_none() {
-        eprintln!(
-            "skipping real-checkpoint gate: {repo_id} not present with safetensors weights \
-             (mlxcel download {repo_id})"
-        );
+        let reason =
+            format!("{repo_id} not present with safetensors weights (mlxcel download {repo_id})");
+        if std::env::var("MLXCEL_REQUIRE_MODELS").is_ok_and(|v| v != "0") {
+            panic!("MLXCEL_REQUIRE_MODELS is set: {reason}");
+        }
+        eprintln!("skipping real-checkpoint gate: {reason}");
     }
     found
 }
@@ -321,8 +327,11 @@ fn check_pairing<T: DenseSpeculativeTarget + DenseSpeculativeBackbone>(
 #[test]
 fn qwen3_4b_with_the_speculators_dspark_drafter_emits_classic_tokens() {
     let (Some(target_dir), Some(drafter_dir)) = (
-        local_checkpoint("Qwen/Qwen3-4B"),
-        local_checkpoint("RedHatAI/Qwen3-4B-speculator.dspark"),
+        local_checkpoint("Qwen/Qwen3-4B", &["qwen3-4b-bf16"]),
+        local_checkpoint(
+            "RedHatAI/Qwen3-4B-speculator.dspark",
+            &["qwen3-4b-speculator-dspark"],
+        ),
     ) else {
         return;
     };
@@ -334,8 +343,8 @@ fn qwen3_4b_with_the_speculators_dspark_drafter_emits_classic_tokens() {
 #[test]
 fn minicpm5_2b_with_the_openbmb_dspark_drafter_emits_classic_tokens() {
     let (Some(target_dir), Some(drafter_dir)) = (
-        local_checkpoint("openbmb/MiniCPM5-2B"),
-        local_checkpoint("openbmb/MiniCPM5-2B-DSpark"),
+        local_checkpoint("openbmb/MiniCPM5-2B", &["minicpm5-2b"]),
+        local_checkpoint("openbmb/MiniCPM5-2B-DSpark", &["minicpm5-2b-dspark"]),
     ) else {
         return;
     };
