@@ -28,16 +28,80 @@ use mlxcel_core::cache::SequenceId;
 use mlxcel_core::layers::KVCache;
 use mlxcel_core::{MlxArray, UniquePtr};
 
+pub(crate) enum MiniCPMVProcessor {
+    V46(processors::minicpmo::MiniCPMOProcessor),
+    Ocr(processors::minicpm_ocr::MiniCPMOcrProcessor),
+}
+
+pub(crate) struct ImageCrop {
+    image_index: usize,
+    input: processors::minicpmo::MiniCPMOImageInput,
+}
+
 pub struct MiniCPMV46VLModel {
     pub text_model: crate::models::Qwen35Model,
     pub vision_model: encoders::minicpmv4_6::MiniCPMV46VisionModel,
     /// Shared processor for image resizing and normalization.
     /// MiniCPM-V 4.6 uses the same patch-based resizing as MiniCPM-O.
-    pub processor: processors::minicpmo::MiniCPMOProcessor,
+    pub(crate) processor: MiniCPMVProcessor,
     pub eos_token_ids: Vec<i32>,
 }
 
 impl MiniCPMV46VLModel {
+    pub(crate) fn prepare_images<E: FnMut(&str, bool) -> Vec<i32>>(
+        &self,
+        images: &[image::DynamicImage],
+        prompt: &str,
+        encode: &mut E,
+    ) -> anyhow::Result<(Vec<ImageCrop>, crate::minicpmo_prompt::MiniCPMOPromptTokens)> {
+        use crate::multimodal::{minicpm_ocr_prompt, minicpmv46_prompt};
+        match &self.processor {
+            MiniCPMVProcessor::V46(processor) => {
+                let crops = processor.preprocess(images);
+                let sizes = crops
+                    .iter()
+                    .map(|crop| self.image_feature_size_for_processed(crop))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(anyhow::Error::msg)?;
+                let tokens =
+                    minicpmv46_prompt::prepare_minicpmv46_prompt_tokens(prompt, &sizes, encode)
+                        .map_err(anyhow::Error::msg)?;
+                let crops = crops
+                    .into_iter()
+                    .enumerate()
+                    .map(|(image_index, input)| ImageCrop { image_index, input })
+                    .collect();
+                Ok((crops, tokens))
+            }
+            MiniCPMVProcessor::Ocr(processor) => {
+                let mut crops = Vec::new();
+                let mut pages = Vec::new();
+                for (image_index, image) in images.iter().enumerate() {
+                    let page = processor.preprocess(image)?;
+                    let counts = page
+                        .crops
+                        .iter()
+                        .map(|crop| self.image_feature_size_for_processed(crop))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(anyhow::Error::msg)?;
+                    pages.push(minicpm_ocr_prompt::PageLayout {
+                        grid: page.grid,
+                        counts,
+                    });
+                    crops.extend(
+                        page.crops
+                            .into_iter()
+                            .map(|input| ImageCrop { image_index, input }),
+                    );
+                }
+                let tokens =
+                    minicpm_ocr_prompt::prepare(prompt, &pages, processor.use_image_id, encode)
+                        .map_err(anyhow::Error::msg)?;
+                Ok((crops, tokens))
+            }
+        }
+    }
+
     pub fn image_feature_size_for_processed(
         &self,
         processed: &processors::minicpmo::MiniCPMOImageInput,
@@ -46,19 +110,27 @@ impl MiniCPMV46VLModel {
             .output_token_count_for_spatial_shape(processed.spatial_shape)
     }
 
-    pub fn get_input_embeddings(
+    pub(crate) fn get_input_embeddings(
         &self,
         input_ids: &MlxArray,
-        processed_images: &[processors::minicpmo::MiniCPMOImageInput],
+        processed_images: &[ImageCrop],
         image_bounds: &[(usize, usize)],
-    ) -> InputEmbeddings {
+    ) -> anyhow::Result<InputEmbeddings> {
         let inputs_embeds = self.text_model.get_embed_tokens(input_ids);
 
+        if matches!(self.processor, MiniCPMVProcessor::Ocr(_)) {
+            anyhow::ensure!(
+                processed_images.len() == image_bounds.len(),
+                "MiniCPM-OCR has {} crops for {} placeholder spans",
+                processed_images.len(),
+                image_bounds.len()
+            );
+        }
         if processed_images.is_empty() || image_bounds.is_empty() {
-            return InputEmbeddings {
+            return Ok(InputEmbeddings {
                 inputs_embeds,
                 attention_mask_4d: None,
-            };
+            });
         }
 
         let hidden_size = mlxcel_core::array_shape(&inputs_embeds)[2];
@@ -75,7 +147,8 @@ impl MiniCPMV46VLModel {
                 segments.push(segment);
             }
 
-            if let Some(processed) = processed_images.get(image_idx) {
+            if let Some(crop) = processed_images.get(image_idx) {
+                let processed = &crop.input;
                 let pixel_values = mlxcel_core::from_slice_f32(
                     &processed.pixel_values,
                     &processed.pixel_values_shape,
@@ -101,6 +174,11 @@ impl MiniCPMV46VLModel {
                 // here means the processor's `image_feature_size` and the vision
                 // pipeline's effective merge geometry disagree.
                 if num_tokens != span_len as i32 {
+                    anyhow::ensure!(
+                        !matches!(self.processor, MiniCPMVProcessor::Ocr(_)),
+                        "MiniCPM-OCR image {} produced {num_tokens} tokens for a crop span of {span_len}",
+                        crop.image_index
+                    );
                     tracing::warn!(
                         image_index = image_idx,
                         emitted_vision_tokens = num_tokens,
@@ -157,10 +235,10 @@ impl MiniCPMV46VLModel {
             encoders::minicpmo::concat_arrays(&segments, 1)
         };
 
-        InputEmbeddings {
+        Ok(InputEmbeddings {
             inputs_embeds: final_embeds,
             attention_mask_4d: None,
-        }
+        })
     }
 }
 

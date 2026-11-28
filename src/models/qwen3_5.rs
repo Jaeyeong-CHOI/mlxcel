@@ -1639,6 +1639,17 @@ pub struct Qwen35Model {
 }
 
 impl Qwen35Model {
+    pub(crate) fn preserve_norm_input_dtype(&mut self) {
+        self.norm.preserve_input_dtype();
+        for layer in &mut self.layers {
+            layer.input_layernorm.preserve_input_dtype();
+            layer.post_attention_layernorm.preserve_input_dtype();
+            if let Qwen35AttentionVariant::FullAttention(attn) = &mut layer.attention {
+                attn.preserve_norm_input_dtype();
+            }
+        }
+    }
+
     fn forward_internal(
         &self,
         input_ids: &MlxArray,
@@ -4327,6 +4338,9 @@ struct TextBackbone<'a> {
 /// reads the HF spelling (`model.embed_tokens`, `model.layers.N`, `model.norm`),
 /// so the bare layout has to be wrapped first. `lm_head.*` is top-level in BOTH
 /// layouts and is deliberately left alone, as is anything already wrapped.
+///
+/// Used by: the Qwen3.5 text backbone loader and the MiniCPM-V 4.6 / MiniCPM-OCR
+/// loader in `src/loading/vlm_special.rs`.
 pub(crate) fn restore_text_model_prefix(weights: WeightMap) -> WeightMap {
     const WRAPPED: [&str; 3] = ["embed_tokens.", "layers.", "norm."];
     let bare = weights
@@ -4349,6 +4363,21 @@ pub(crate) fn restore_text_model_prefix(weights: WeightMap) -> WeightMap {
             }
         })
         .collect()
+}
+
+/// Used by: Qwen3.5-family raw-weight sanitization and MiniCPM-OCR's
+/// pre-conversion dtype policy. The latter must preserve exactly the scales
+/// that the former shifts.
+pub(crate) fn is_shifted_norm(key: &str) -> bool {
+    [
+        ".input_layernorm.weight",
+        ".post_attention_layernorm.weight",
+        "model.norm.weight",
+        ".q_norm.weight",
+        ".k_norm.weight",
+    ]
+    .iter()
+    .any(|suffix| key.ends_with(suffix))
 }
 
 ///
@@ -4392,13 +4421,6 @@ pub fn sanitize_weights(
     }
 
     // 4. Conv1d weight transpose and 5. Norm weight shift
-    let norm_suffixes = [
-        ".input_layernorm.weight",
-        ".post_attention_layernorm.weight",
-        "model.norm.weight",
-        ".q_norm.weight",
-        ".k_norm.weight",
-    ];
 
     let keys: Vec<String> = weights.keys().cloned().collect();
     for k in &keys {
@@ -4412,7 +4434,7 @@ pub fn sanitize_weights(
         }
 
         // Norm weight shift (+1.0) when should_shift_norms
-        if should_shift_norms && norm_suffixes.iter().any(|sfx| k.ends_with(sfx)) {
+        if should_shift_norms && is_shifted_norm(k) {
             let v = weights.get(k.as_str()).unwrap();
             let ndim = mlxcel_core::array_shape(v).len();
             if ndim == 1 {

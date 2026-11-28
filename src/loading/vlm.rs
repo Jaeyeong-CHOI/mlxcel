@@ -406,6 +406,11 @@ fn finish_vlm_weights_common(
                     weights,
                     crate::models::gemma3n_bf16_key,
                 )
+            } else if vlm_config.as_ref().is_some_and(is_minicpm_ocr) {
+                crate::models::convert_bf16_weights_with_keep(
+                    weights,
+                    crate::models::qwen3_5::is_shifted_norm,
+                )
             } else {
                 crate::models::convert_bf16_weights(weights)
             };
@@ -496,6 +501,13 @@ fn is_model_quantized(model_path: &Path) -> bool {
         }
     }
     false
+}
+
+/// Match detection's case-insensitive model type in both dtype policy and graph construction.
+fn is_minicpm_ocr(config: &Value) -> bool {
+    config["model_type"]
+        .as_str()
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("minicpm_ocr"))
 }
 
 fn is_gemma3n_model(model_path: &Path) -> bool {

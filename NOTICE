@@ -61,6 +61,9 @@ Portions of mlxcel's model architectures, tokenizer handling, batch
 scheduler, and server API translators are ported from or mirror mlx-lm
 (https://github.com/ml-explore/mlx-lm), Copyright 2023 Apple Inc., and
 mlx-vlm (https://github.com/Blaizzy/mlx-vlm), Copyright 2025 Prince Canuma.
+The MiniCPM-OCR slicing and placeholder modules derive from
+mlx_vlm/models/minicpm_ocr and minicpmv4_6 (commit 230fc308), including
+the image processor adapted from OpenBMB's Apache-2.0 MiniCPM-OCR.
 Portions of mlxcel's audio model coverage and DSP (text-to-speech and
 speech-to-text feature extraction) are ported from or mirror mlx-audio
 (https://github.com/Blaizzy/mlx-audio), Copyright 2024 Prince Canuma.

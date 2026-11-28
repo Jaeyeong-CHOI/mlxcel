@@ -641,6 +641,7 @@ pub enum ModelType {
     Idefics2, // Idefics2 (idefics2): SigLIP + perceiver-resampler connector + Mistral text
     MiniCPMOVLM, // MiniCPM-o (dynamic SigLIP + resampler + Qwen3-VL text)
     MiniCPMV46VLM, // MiniCPM-V 4.6 (SigLIP + VitMerger + Merger + Qwen3.5 text)
+    MiniCPMOcrVLM, // MiniCPM-OCR 1.0 (sliced pages + Qwen3.5 text)
     Moondream3VLM, // Moondream3 (custom ViT + custom text decoder, query/caption image path)
     Moondream2VLM, // Moondream2 (SigLIP-style ViT + Phi text decoder + crop tiling)
     /// Florence-2 (`florence2`): DaViT vision tower + BART encoder-decoder
@@ -970,6 +971,7 @@ pub const ALL_MODEL_TYPES: &[ModelType] = &[
     ModelType::Idefics2,
     ModelType::MiniCPMOVLM,
     ModelType::MiniCPMV46VLM,
+    ModelType::MiniCPMOcrVLM,
     ModelType::Moondream3VLM,
     ModelType::Moondream2VLM,
     ModelType::Florence2VLM,
@@ -1571,6 +1573,10 @@ impl ModelType {
                 "MiniCPM-o (dynamic SigLIP + resampler + Qwen3-VL text)",
                 "Other VLM",
             ),
+            ModelType::MiniCPMOcrVLM => (
+                "MiniCPM-OCR 1.0 (minicpm_ocr; sliced SigLIP + Qwen3.5 text)",
+                "Other VLM",
+            ),
             ModelType::MiniCPMV46VLM => (
                 "MiniCPM-V 4.6 (SigLIP + VitMerger + Merger + Qwen3.5 text)",
                 "Other VLM",
@@ -1693,6 +1699,7 @@ mod metadata_tests {
             Idefics2,
             MiniCPMOVLM,
             MiniCPMV46VLM,
+            MiniCPMOcrVLM,
             Moondream3VLM,
             Moondream2VLM,
             Florence2VLM,

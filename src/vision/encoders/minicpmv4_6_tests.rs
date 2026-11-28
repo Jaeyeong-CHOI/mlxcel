@@ -216,3 +216,15 @@ fn merger_rejects_zero_merge_kernel_size() {
 
     assert!(err.contains("merge_kernel_size"));
 }
+
+#[test]
+fn minicpm_ocr_unknown_downsample_mode_names_value() {
+    let result =
+        serde_json::from_value::<MiniCPMV46Config>(serde_json::json!({"downsample_mode":"8x"}));
+    assert!(
+        result
+            .expect_err("invalid mode accepted")
+            .to_string()
+            .contains("8x")
+    );
+}

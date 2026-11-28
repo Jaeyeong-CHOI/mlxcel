@@ -56,6 +56,7 @@ pub mod kimi_vl_prompt;
 pub mod lfm2_vl_prompt;
 pub mod llmjp_vl_prompt;
 pub mod locateanything_prompt;
+pub(crate) mod minicpm_ocr_prompt;
 pub mod minicpmo_prompt;
 pub mod minicpmv46_prompt;
 pub mod moondream2_prompt;

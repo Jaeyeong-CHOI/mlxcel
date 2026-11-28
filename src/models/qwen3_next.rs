@@ -602,6 +602,16 @@ pub(crate) struct Qwen3NextAttention {
 }
 
 impl Qwen3NextAttention {
+    #[cfg(test)]
+    pub(crate) fn qk_norms(&self) -> [&RMSNorm; 2] {
+        [&self.q_norm, &self.k_norm]
+    }
+
+    pub(crate) fn preserve_norm_input_dtype(&mut self) {
+        self.q_norm.preserve_input_dtype();
+        self.k_norm.preserve_input_dtype();
+    }
+
     /// Head counts and head dim for [`prefill_causal_mask`] (#3051).
     pub(crate) fn prefill_attention(&self) -> PrefillAttention {
         PrefillAttention {

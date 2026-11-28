@@ -1239,6 +1239,7 @@ pub(crate) fn detect_model_type_with_probes<P: ModelDetectionProbes + ?Sized>(
         "idefics2" => Ok(ModelType::Idefics2),
         "minicpmo" => Ok(ModelType::MiniCPMOVLM),
         "minicpmv4_6" => Ok(ModelType::MiniCPMV46VLM),
+        "minicpm_ocr" => Ok(ModelType::MiniCPMOcrVLM),
         "moondream3" => Ok(ModelType::Moondream3VLM),
         "moondream2" | "moondream1" => Ok(ModelType::Moondream2VLM),
         "granite_vision" => Ok(ModelType::GraniteVisionVLM),

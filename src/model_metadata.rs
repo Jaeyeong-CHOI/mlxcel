@@ -167,6 +167,7 @@ macro_rules! for_each_model_registration {
             Plamo2VLM => { kind: Vlm, directory: Vlm, weight: None, adapter: Some("PLaMo 2.1 VL does not support adapter loading; use load_model() instead") };
             MiniCPMOVLM => { kind: Vlm, directory: Vlm, weight: None, adapter: Some("MiniCPM-o VLM does not support adapter loading; use load_model() instead") };
             MiniCPMV46VLM => { kind: Vlm, directory: Vlm, weight: None, adapter: Some("MiniCPM-V 4.6 VLM does not support adapter loading; use load_model() instead") };
+            MiniCPMOcrVLM => { kind: Vlm, directory: Vlm, weight: None, adapter: Some("MiniCPM-OCR VLM does not support adapter loading; use load_model() instead") };
             Moondream3VLM => { kind: Vlm, directory: Vlm, weight: None, adapter: Some("Moondream3 VLM does not support adapter loading; use load_model() instead") };
             Moondream2VLM => { kind: Vlm, directory: Vlm, weight: None, adapter: Some("Moondream2 VLM does not support adapter loading; use load_model() instead") };
             Florence2VLM => { kind: Vlm, directory: Vlm, weight: None, adapter: Some("Florence-2 does not support adapter loading; use load_model() instead") };

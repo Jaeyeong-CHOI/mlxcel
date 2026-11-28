@@ -681,6 +681,7 @@ impl UnifiedEmbedding {
 
 /// RMS Normalization layer
 pub struct RMSNorm {
+    keep_input_dtype: bool,
     pub weight: UniquePtr<MlxArray>,
     pub eps: f32,
 }
@@ -688,12 +689,27 @@ pub struct RMSNorm {
 impl RMSNorm {
     /// Create a new RMS norm layer
     pub fn new(weight: UniquePtr<MlxArray>, eps: f32) -> Self {
-        Self { weight, eps }
+        Self {
+            weight,
+            eps,
+            keep_input_dtype: false,
+        }
     }
 
-    /// Forward pass using fast RMS norm kernel
+    /// Keep the shifted scale in float32 while returning the activation dtype.
+    /// Used by: MiniCPM-OCR's Qwen3.5 decoder and Qwen3NextAttention Q/K norms.
+    pub fn preserve_input_dtype(&mut self) {
+        self.keep_input_dtype = true;
+    }
+
+    /// MiniCPM-OCR opts into an activation-dtype result with float32 scales.
     pub fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
-        ffi::fast_rms_norm(x, &self.weight, self.eps)
+        let y = ffi::fast_rms_norm(x, &self.weight, self.eps);
+        if self.keep_input_dtype {
+            ffi::astype(&y, ffi::array_dtype(x))
+        } else {
+            y
+        }
     }
 }
 

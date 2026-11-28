@@ -77,18 +77,28 @@ pub fn expand_minicpmv46_image_placeholders(
         .map(|(index, &size)| minicpmv46_image_placeholder(index, size))
         .collect();
 
+    place_image_blocks(prompt, &placeholders, "MiniCPM-V 4.6")
+}
+
+/// Used by: MiniCPM-V 4.6 text expansion and MiniCPM-OCR token expansion.
+pub(super) fn place_image_blocks<S: AsRef<str>>(
+    prompt: &str,
+    placeholders: &[S],
+    family: &str,
+) -> Result<String, String> {
+    let num_images = placeholders.len();
     let segments = split_on_image_markers(prompt);
 
     let markers = segments.len() - 1;
     if markers > 0 {
         if markers != num_images {
             return Err(format!(
-                "MiniCPM-V 4.6 prompt contains {markers} image marker(s) but {num_images} image(s) were provided"
+                "{family} prompt contains {markers} image marker(s) but {num_images} image(s) were provided"
             ));
         }
         let mut expanded = String::from(segments[0]);
         for (placeholder, segment) in placeholders.iter().zip(&segments[1..]) {
-            expanded.push_str(placeholder);
+            expanded.push_str(placeholder.as_ref());
             expanded.push_str(segment);
         }
         if expanded.contains("<|im_start|>") {
@@ -100,8 +110,8 @@ pub fn expand_minicpmv46_image_placeholders(
     }
 
     let mut image_items = String::new();
-    for placeholder in &placeholders {
-        image_items.push_str(placeholder);
+    for placeholder in placeholders {
+        image_items.push_str(placeholder.as_ref());
         image_items.push('\n');
     }
     if let Some(pos) = prompt.rfind(USER_TURN) {
@@ -150,7 +160,7 @@ fn split_on_image_markers(prompt: &str) -> Vec<&str> {
     segments
 }
 
-fn single_token_id<E>(text: &str, encode: &mut E) -> Result<i32, String>
+pub(super) fn single_token_id<E>(text: &str, encode: &mut E) -> Result<i32, String>
 where
     E: FnMut(&str, bool) -> Vec<i32>,
 {

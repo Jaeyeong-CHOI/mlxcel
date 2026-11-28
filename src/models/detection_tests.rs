@@ -2726,3 +2726,26 @@ fn longcat_flash_sparse_is_detected_with_and_without_model_type() {
     assert!(err.to_string().contains("model_type"), "{err}");
     fs::remove_dir_all(model_dir).unwrap();
 }
+
+#[test]
+fn minicpm_ocr_checkpoint_routes_to_ocr() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("config.json"),
+        json!({
+            "model_type": "minicpm_ocr",
+            "architectures": ["MiniCPMOcrForConditionalGeneration"],
+            "text_config": {"model_type":"qwen3_5_text"},
+            "vision_config": {"model_type":"minicpm_ocr_vision"}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        format!(
+            "{:?}",
+            super::detection::get_model_type(dir.path()).unwrap()
+        ),
+        "MiniCPMOcrVLM"
+    );
+}

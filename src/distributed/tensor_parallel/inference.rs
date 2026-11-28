@@ -510,6 +510,7 @@ fn fallback_architecture(model_type: ModelType) -> &'static str {
         // MiniCPM-V 4.6 uses Qwen3.5 backbone; TP is not supported for VLM-kind
         // models and the loader refuses TP routing earlier. Return placeholder.
         ModelType::MiniCPMV46VLM => "minicpmv4_6",
+        ModelType::MiniCPMOcrVLM => "minicpm_ocr",
         // DiffusionGemma is not supported by tensor-parallel inference (the
         // planner's supported-architecture validation rejects this string
         // before any TP load is attempted).

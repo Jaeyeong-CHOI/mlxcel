@@ -78,7 +78,7 @@ impl MiniCPMV46VisionConfig {
             .map(GeluActivation::in_f32_compiled)
             .ok_or_else(|| {
                 format!(
-                    "MiniCPM-V 4.6 vision_config.hidden_act `{}` is not a GELU variant",
+                    "MiniCPM vision_config.hidden_act `{}` is not a GELU variant",
                     self.hidden_act
                 )
             })
@@ -117,9 +117,17 @@ pub(crate) fn to_minicpmo_vision_config(cfg: &MiniCPMV46VisionConfig) -> MiniCPM
     }
 }
 
-/// Whole-model config loaded from the MiniCPM-V 4.6 `config.json`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+pub enum DownsampleMode {
+    #[serde(rename = "4x")]
+    X4,
+    #[serde(rename = "16x")]
+    X16,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct MiniCPMV46Config {
+    pub downsample_mode: Option<DownsampleMode>,
     #[serde(default = "default_insert_layer_id")]
     pub insert_layer_id: usize,
     #[serde(default = "default_merge_kernel_size")]
@@ -282,7 +290,7 @@ impl VitMerger {
         let group_w = merge_group_size[1];
         if group_h == 0 || group_w == 0 {
             return Err(
-                "MiniCPM-V 4.6 VitMerger window_kernel_size entries must be positive".to_string(),
+                "MiniCPM VitMerger window_kernel_size entries must be positive".to_string(),
             );
         }
         let group_tokens = (group_h * group_w) as i32;
@@ -447,9 +455,7 @@ impl MiniCPMV46Merger {
         bits: i32,
     ) -> Result<Self, String> {
         if merge_kernel_size[0] == 0 || merge_kernel_size[1] == 0 {
-            return Err(
-                "MiniCPM-V 4.6 merger merge_kernel_size entries must be positive".to_string(),
-            );
+            return Err("MiniCPM merger merge_kernel_size entries must be positive".to_string());
         }
 
         let mut blocks = Vec::with_capacity(merger_times);
@@ -481,7 +487,7 @@ impl MiniCPMV46Merger {
         for _ in &self.blocks {
             if !grid_h.is_multiple_of(self.merge_h) || !grid_w.is_multiple_of(self.merge_w) {
                 return Err(format!(
-                    "MiniCPM-V 4.6 patch grid {}x{} is not divisible by merger kernel {}x{}",
+                    "MiniCPM patch grid {}x{} is not divisible by merger kernel {}x{}",
                     grid_h, grid_w, self.merge_h, self.merge_w
                 ));
             }
@@ -548,7 +554,7 @@ pub struct MiniCPMV46VisionModel {
     vit_merger: VitMerger,
     pub merger: MiniCPMV46Merger,
     /// Which encoder layer to insert VitMerger after (0-indexed).
-    insert_layer_id: usize,
+    insert_layer_id: Option<usize>,
     num_layers: usize,
 }
 
@@ -563,6 +569,14 @@ impl MiniCPMV46VisionModel {
         group_size: i32,
         bits: i32,
     ) -> Result<Self, String> {
+        let insert_layer_id = (model_cfg.downsample_mode != Some(DownsampleMode::X4))
+            .then_some(model_cfg.insert_layer_id);
+        if insert_layer_id.is_some_and(|index| index >= vision_cfg.num_hidden_layers) {
+            return Err(format!(
+                "MiniCPM-V insert_layer_id {} is outside {} vision layers",
+                model_cfg.insert_layer_id, vision_cfg.num_hidden_layers
+            ));
+        }
         let mut base_cfg = to_minicpmo_vision_config(vision_cfg);
         base_cfg.mlp_activation = vision_cfg.mlp_activation()?;
         let encoder =
@@ -593,7 +607,7 @@ impl MiniCPMV46VisionModel {
             encoder,
             vit_merger,
             merger,
-            insert_layer_id: model_cfg.insert_layer_id,
+            insert_layer_id,
             num_layers: vision_cfg.num_hidden_layers,
         })
     }
@@ -601,39 +615,44 @@ impl MiniCPMV46VisionModel {
     /// Compute how many vision tokens the full MiniCPM-V 4.6 vision pipeline
     /// emits for a preprocessed patch grid.
     ///
-    /// Used by request-time prompt preparation to reserve exactly one
-    /// `<unk>` placeholder per emitted vision token before text tokenization.
+    /// Used by: MiniCPM-V 4.6 and MiniCPM-OCR prompt preparation to reserve
+    /// one image-pad token per feature under the active merger geometry.
     pub fn output_token_count_for_spatial_shape(
         &self,
         spatial_shape: (i32, i32),
     ) -> Result<usize, String> {
         if spatial_shape.0 <= 0 || spatial_shape.1 <= 0 {
             return Err(format!(
-                "MiniCPM-V 4.6 spatial shape must be positive, got {:?}",
+                "MiniCPM spatial shape must be positive, got {:?}",
                 spatial_shape
             ));
         }
 
         let grid_h = spatial_shape.0 as usize;
         let grid_w = spatial_shape.1 as usize;
-        if !grid_h.is_multiple_of(self.vit_merger.group_h)
-            || !grid_w.is_multiple_of(self.vit_merger.group_w)
-        {
+        let (group_h, group_w) = if self.insert_layer_id.is_some() {
+            (self.vit_merger.group_h, self.vit_merger.group_w)
+        } else {
+            (1, 1)
+        };
+        if !grid_h.is_multiple_of(group_h) || !grid_w.is_multiple_of(group_w) {
             return Err(format!(
-                "MiniCPM-V 4.6 patch grid {}x{} is not divisible by VitMerger group {}x{}",
-                grid_h, grid_w, self.vit_merger.group_h, self.vit_merger.group_w
+                "MiniCPM patch grid {}x{} is not divisible by VitMerger group {}x{}",
+                grid_h, grid_w, group_h, group_w
             ));
         }
 
-        let grid_h = grid_h / self.vit_merger.group_h;
-        let grid_w = grid_w / self.vit_merger.group_w;
+        let grid_h = grid_h / group_h;
+        let grid_w = grid_w / group_w;
         let (grid_h, grid_w) = self.merger.output_grid_size(grid_h, grid_w)?;
         grid_h
             .checked_mul(grid_w)
-            .ok_or_else(|| "MiniCPM-V 4.6 output token count overflowed usize".to_string())
+            .ok_or_else(|| "MiniCPM output token count overflowed usize".to_string())
     }
 
-    /// Run the full vision forward pass on a single image.
+    /// Run the vision forward pass on one crop.
+    ///
+    /// Used by: MiniCPM-V 4.6 (one crop) and MiniCPM-OCR (source and slices).
     ///
     /// `pixel_values`: `[1, H, W, 3]` (HWC, 1-batch)
     /// `spatial_shape`: `(h_patches, w_patches)`
@@ -652,7 +671,7 @@ impl MiniCPMV46VisionModel {
         for layer_idx in 0..self.num_layers {
             hidden = self.encoder.forward_layer(&hidden, layer_idx);
 
-            if layer_idx == self.insert_layer_id {
+            if Some(layer_idx) == self.insert_layer_id {
                 // hidden shape is [1, seq_len, hidden_size]; strip batch dim.
                 let h_shape = mlxcel_core::array_shape(&hidden);
                 let seq_len = h_shape[1];

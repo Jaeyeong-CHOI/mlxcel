@@ -38,7 +38,6 @@ use crate::multimodal::gemma3_vlm_prompt::{
 };
 use crate::multimodal::got_ocr_prompt::prepare_got_prompt_tokens;
 use crate::multimodal::llmjp_vl_prompt::{insert_llmjp_image_tokens, text_token_count};
-use crate::multimodal::minicpmv46_prompt::prepare_minicpmv46_prompt_tokens;
 use crate::multimodal::plamo2_vl_prompt::{Plamo2VlImageTokenIds, prepare_plamo2_vl_prompt_tokens};
 use crate::phi3v_prompt::prepare_phi3v_prompt_tokens;
 use crate::phi4_siglip_prompt::prepare_phi4_siglip_prompt_tokens;
@@ -1590,19 +1589,8 @@ where
         // `minicpmv46_prompt`), and it runs a Qwen3.5 text backbone with the
         // VitMerger+Merger vision pipeline instead of the resampler.
         VlmRuntimeRef::MiniCPMV46(minicpmv46) => {
-            let processed_images = minicpmv46.processor.preprocess(images);
-            let image_feature_sizes: Vec<usize> = processed_images
-                .iter()
-                .map(|processed| {
-                    minicpmv46
-                        .image_feature_size_for_processed(processed)
-                        .map_err(|err| anyhow::anyhow!("{}", err))
-                })
-                .collect::<Result<Vec<_>>>()?;
-
-            let prepared =
-                prepare_minicpmv46_prompt_tokens(prompt, &image_feature_sizes, &mut encode)
-                    .map_err(|err| anyhow::anyhow!("{}", err))?;
+            let (processed_images, prepared) =
+                minicpmv46.prepare_images(images, prompt, &mut encode)?;
             *prompt_tokens = prepared.tokens;
 
             let input_ids_arr = prompt_ids_array(prompt_tokens);
@@ -1610,7 +1598,7 @@ where
                 &input_ids_arr,
                 &processed_images,
                 &prepared.image_bounds,
-            );
+            )?;
 
             Ok(Some(PreparedVlmEmbeddings {
                 embeddings,

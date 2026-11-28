@@ -555,15 +555,23 @@ pub(crate) fn load_minicpmv4_6_vlm(model_path: &Path) -> Result<LoadedModel> {
 
     let (_config_str, full_config) = read_sanitized_vlm_config(model_path)?;
 
+    let is_ocr = super::is_minicpm_ocr(&full_config);
+    let family = if is_ocr {
+        "MiniCPM-OCR"
+    } else {
+        "MiniCPM-V 4.6"
+    };
+
     // MiniCPM-V 4.6 uses Qwen3.5-Text (hybrid linear+full-attention) as the
     // language backbone. The LLM fields are nested under "text_config"; fall
     // back to root if absent (future-proofing and test configs).
-    let text_config_value = full_config
+    let mut text_config_value = full_config
         .get("text_config")
         .cloned()
         .unwrap_or_else(|| full_config.clone());
+    inherit_quantization_if_missing(&mut text_config_value, &full_config)?;
     let text_config: models::qwen3_5::Qwen35Config = serde_json::from_value(text_config_value)
-        .map_err(|e| anyhow::anyhow!("Failed to parse MiniCPM-V 4.6 text config: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to parse {family} text config: {e}"))?;
     // The gated-delta / MRoPE invariants `validate_supported` enforces belong
     // to `Qwen35Model`, which this loader builds via `from_weights` below,
     // not to the `qwen3_5` model_type string. A MiniCPM-V 4.6 checkpoint that
@@ -572,14 +580,65 @@ pub(crate) fn load_minicpmv4_6_vlm(model_path: &Path) -> Result<LoadedModel> {
     // guard was written to close for the other five Qwen3.5-family sites.
     text_config.validate_supported()?;
 
-    let vision_config: MiniCPMV46VisionConfig =
-        parse_required_vlm_subconfig(&full_config, "vision_config", "MiniCPM-V 4.6 vision config")?;
+    let vision_config: MiniCPMV46VisionConfig = parse_required_vlm_subconfig(
+        &full_config,
+        "vision_config",
+        &format!("{family} vision config"),
+    )?;
 
-    let model_cfg: MiniCPMV46Config = serde_json::from_value(full_config.clone())
-        .map_err(|e| anyhow::anyhow!("Failed to parse MiniCPM-V 4.6 model config: {}", e))?;
+    let mut model_cfg: MiniCPMV46Config = serde_json::from_value(full_config.clone())
+        .map_err(|e| anyhow::anyhow!("Failed to parse {family} model config: {e}"))?;
 
-    let processor_config = minicpmo_processor_config_value(model_path, &full_config)
-        .unwrap_or_else(|| full_config.clone());
+    let preprocessor_path = model_path.join("preprocessor_config.json");
+    let has_ocr_preprocessor = is_ocr && preprocessor_path.try_exists()?;
+    let processor_config = if has_ocr_preprocessor {
+        serde_json::from_reader(std::fs::File::open(&preprocessor_path)?)
+            .map_err(|e| anyhow::anyhow!("Invalid MiniCPM-OCR preprocessor_config.json: {e}"))?
+    } else {
+        minicpmo_processor_config_value(model_path, &full_config)
+            .unwrap_or_else(|| full_config.clone())
+    };
+
+    use vision::encoders::minicpmv4_6::DownsampleMode;
+    use vision::minicpmv4_6_vl::MiniCPMVProcessor;
+    let ocr = if is_ocr {
+        let mut processor: vision::processors::minicpm_ocr::MiniCPMOcrProcessor =
+            serde_json::from_value(processor_config.clone()).map_err(|e| {
+                let source = if has_ocr_preprocessor {
+                    "preprocessor_config.json"
+                } else {
+                    "processor configuration"
+                };
+                anyhow::anyhow!("Invalid {family} {source}: {e}")
+            })?;
+        if let (Some(config_mode), Some(processor_mode)) =
+            (model_cfg.downsample_mode, processor.downsample_mode)
+            && config_mode != processor_mode
+        {
+            tracing::warn!(
+                ?config_mode,
+                ?processor_mode,
+                "MiniCPM-OCR downsample_mode mismatch; using config.json for both the encoder and processor"
+            );
+        }
+        let mode = model_cfg
+            .downsample_mode
+            .or(processor.downsample_mode)
+            .unwrap_or(DownsampleMode::X4);
+        model_cfg.downsample_mode = Some(mode);
+        processor.downsample_mode = Some(mode);
+        anyhow::ensure!(
+            processor.patch_size as usize == vision_config.patch_size
+                && model_cfg.merge_kernel_size == [2, 2]
+                && model_cfg.merger_times == 1
+                && vision_config.window_kernel_size == [2, 2],
+            "MiniCPM-OCR processor and encoder geometry disagree"
+        );
+        processor.validate()?;
+        Some(processor)
+    } else {
+        None
+    };
 
     let raw_weights = load_vlm_weights_common(model_path, None)?;
     let (group_size, bits) = parse_quantization_params(&full_config);
@@ -588,7 +647,18 @@ pub(crate) fn load_minicpmv4_6_vlm(model_path: &Path) -> Result<LoadedModel> {
     let weights = remap_minicpmv4_6_weights(&raw_weights);
 
     // Build text-only weight map (de-prefixed for Qwen35Model).
-    let mut text_weights = minicpmv4_6_text_weights(&weights);
+    let mut text_weights =
+        models::qwen3_5::restore_text_model_prefix(minicpmv4_6_text_weights(&weights));
+
+    // HF adds one in float32. Promote before either the text dtype policy or
+    // Qwen3.5's raw-layout sanitization (converted norms are already shifted).
+    if is_ocr {
+        for (key, value) in &mut text_weights {
+            if models::qwen3_5::is_shifted_norm(key) {
+                *value = mlxcel_core::astype(value, mlxcel_core::dtype::FLOAT32);
+            }
+        }
+    }
 
     // Apply bf16→f16 for non-quantized text model weights on Apple Silicon.
     if bits == 0 {
@@ -616,8 +686,12 @@ pub(crate) fn load_minicpmv4_6_vlm(model_path: &Path) -> Result<LoadedModel> {
 
     models::sanitize_tied_embeddings(&mut text_weights, &full_config);
 
-    let text_model = models::Qwen35Model::from_weights(&text_weights, &text_config)
-        .map_err(|e| anyhow::anyhow!("Failed to load MiniCPM-V 4.6 text model: {}", e))?;
+    let mut text_model = models::Qwen35Model::from_weights(&text_weights, &text_config)
+        .map_err(|e| anyhow::anyhow!("Failed to load {family} text model: {e}"))?;
+
+    if is_ocr {
+        text_model.preserve_norm_input_dtype();
+    }
 
     // MiniCPMV46VisionModel::from_weights uses the remapped weight map with:
     //   vision tower   prefix = "vision_tower"
@@ -633,7 +707,7 @@ pub(crate) fn load_minicpmv4_6_vlm(model_path: &Path) -> Result<LoadedModel> {
         group_size,
         bits,
     )
-    .map_err(|e| anyhow::anyhow!("Failed to load MiniCPM-V 4.6 vision model: {}", e))?;
+    .map_err(|e| anyhow::anyhow!("Failed to load {family} vision model: {e}"))?;
 
     // "query_num" is the mlx-vlm upstream field; "image_feature_size" appears in
     // the processor_config.json image_processor dict of real checkpoints.
@@ -655,7 +729,11 @@ pub(crate) fn load_minicpmv4_6_vlm(model_path: &Path) -> Result<LoadedModel> {
         .unwrap_or(448) as usize;
 
     let resize_multiple_for_axis = |axis: usize| -> Result<usize> {
-        let vit_factor = vision_config.window_kernel_size[axis].max(1);
+        let vit_factor = if model_cfg.downsample_mode == Some(DownsampleMode::X4) {
+            1
+        } else {
+            vision_config.window_kernel_size[axis].max(1)
+        };
         let merge_factor = model_cfg.merge_kernel_size[axis].max(1);
         let mut downsample = vit_factor;
         for _ in 0..model_cfg.merger_times {
@@ -675,21 +753,20 @@ pub(crate) fn load_minicpmv4_6_vlm(model_path: &Path) -> Result<LoadedModel> {
     // Merger.  Compute that alignment from config instead of hardcoding 4 so
     // rectangular images still reserve the same number of text placeholders as
     // vision tokens emitted by the dynamic grid.
-    let processor = MiniCPMOProcessor::new_with_resize_multiples(
-        patch_size,
-        scale_resolution,
-        image_feature_size,
-        resize_multiple_for_axis(0)?,
-        resize_multiple_for_axis(1)?,
-    );
-
-    let eos_token_ids = match full_config.get("eos_token_id") {
-        Some(Value::Array(values)) => values
-            .iter()
-            .filter_map(|v| v.as_i64().map(|id| id as i32))
-            .collect(),
-        Some(Value::Number(value)) => value.as_i64().map(|id| vec![id as i32]).unwrap_or_default(),
-        _ => Vec::new(),
+    let processor = match ocr {
+        Some(processor) => MiniCPMVProcessor::Ocr(processor),
+        None => MiniCPMVProcessor::V46(MiniCPMOProcessor::new_with_resize_multiples(
+            patch_size,
+            scale_resolution,
+            image_feature_size,
+            resize_multiple_for_axis(0)?,
+            resize_multiple_for_axis(1)?,
+        )),
+    };
+    let eos_token_ids = if is_ocr {
+        crate::read_eos_token_ids(model_path)
+    } else {
+        crate::loading::parse_eos_token_ids(&full_config)
     };
 
     Ok(LoadedModel::MiniCPMV46VLM(MiniCPMV46VLModel {
@@ -2941,3 +3018,7 @@ pub(crate) fn load_llama4_vlm(model_path: &Path) -> Result<LoadedModel> {
 #[cfg(test)]
 #[path = "vlm_special_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "minicpm_ocr_tests.rs"]
+mod minicpm_ocr_tests;

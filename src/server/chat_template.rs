@@ -238,6 +238,8 @@ pub struct ChatTemplateProcessor {
     /// path that constructs a processor without a corresponding tokenizer
     /// (template-string overrides, `Default`, tests).
     default_enable_thinking: bool,
+    /// The OCR checkpoint primes document transcription with a closed think block.
+    minicpm_ocr: bool,
     /// Text appended to a *generation* render whose output stops at a bare
     /// role opener the checkpoint's own processor completes in Python.
     ///
@@ -525,6 +527,10 @@ impl ChatTemplateProcessor {
             supports_tools_cached: None,
             forced_tool_call_format,
             default_enable_thinking: false,
+            minicpm_ocr: matches!(
+                crate::models::get_model_type(model_path),
+                Ok(crate::models::ModelType::MiniCPMOcrVLM)
+            ),
             generation_prompt_suffix: generation_prompt_suffix_for(model_path),
             numbered_image_tags: None,
             deepseek_vl2: None,
@@ -555,6 +561,7 @@ impl ChatTemplateProcessor {
             supports_tools_cached: None,
             forced_tool_call_format,
             default_enable_thinking: false,
+            minicpm_ocr: false,
             generation_prompt_suffix: None,
             numbered_image_tags: None,
             deepseek_vl2: None,
@@ -843,7 +850,7 @@ impl ChatTemplateProcessor {
     /// Used by: `commands::generate` and `server::startup` before flipping the
     /// `enable_thinking` default for a thinking-marker tokenizer.
     pub fn wants_thinking_default_off(&self) -> bool {
-        self.is_gemma4_thinking_channel_template()
+        self.minicpm_ocr || self.is_gemma4_thinking_channel_template()
     }
 
     /// Detect a chat template that gates its `<think>` block on a bare
@@ -2352,9 +2359,9 @@ fn builtin_chat_template(family: Option<crate::models::ModelType>) -> Option<&'s
         crate::models::ModelType::GotOcrVLM => Some(GOT_OCR_CHAT_TEMPLATE),
         crate::models::ModelType::Plamo2VLM => Some(PLAMO2_VL_CHAT_TEMPLATE),
         crate::models::ModelType::UnlimitedOcrVLM => Some(UNLIMITED_OCR_CHAT_TEMPLATE),
-        crate::models::ModelType::MiniCPMV46VLM | crate::models::ModelType::MiniCPMOVLM => {
-            Some(MINICPM_CHATML_TEMPLATE)
-        }
+        crate::models::ModelType::MiniCPMOcrVLM
+        | crate::models::ModelType::MiniCPMV46VLM
+        | crate::models::ModelType::MiniCPMOVLM => Some(MINICPM_CHATML_TEMPLATE),
         _ => None,
     }
 }
@@ -4719,6 +4726,25 @@ TOOL
             out.contains("KEEP"),
             "preserve_thinking=true must reach template"
         );
+    }
+
+    #[test]
+    fn minicpm_ocr_uses_its_non_thinking_default() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type":"minicpm_ocr"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("chat_template.jinja"),
+            "{% if enable_thinking %}<think>{% else %}<think>\n\n</think>\n\n{% endif %}",
+        )
+        .unwrap();
+        let processor = ChatTemplateProcessor::from_model_path(dir.path())
+            .unwrap()
+            .unwrap();
+        assert!(processor.wants_thinking_default_off());
     }
 
     // ----- Gemma 4 enable_thinking priming fix -----

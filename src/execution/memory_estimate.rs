@@ -1276,6 +1276,7 @@ fn inspect_registry_id(model_type: ModelType) -> &'static str {
         ModelType::Idefics2 => "idefics2",
         ModelType::MiniCPMOVLM => "minicpmo_vlm",
         ModelType::MiniCPMV46VLM => "minicpmv4_6_vlm",
+        ModelType::MiniCPMOcrVLM => "minicpm_ocr_vlm",
         ModelType::Moondream3VLM => "moondream3_vlm",
         ModelType::Moondream2VLM => "moondream2_vlm",
         ModelType::Florence2VLM => "florence2_vlm",
