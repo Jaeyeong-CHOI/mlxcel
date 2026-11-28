@@ -2666,6 +2666,13 @@ fn is_inkling2_config(config: &Value) -> bool {
         )
 }
 
+/// Whether `config` describes a Talkie checkpoint (`model_type: talkie`).
+///
+/// Used by: [`bf16_to_f16_at_load`].
+fn is_talkie_config(config: &Value) -> bool {
+    config.get("model_type").and_then(Value::as_str) == Some("talkie")
+}
+
 /// Whether `config` describes an Inkling checkpoint: the HMLP-wrapped
 /// `inkling_mm_model`, the standalone `inkling` text model, or a config whose
 /// `text_config` is `inkling_text`. `inkling2` is a different family.
@@ -2744,6 +2751,15 @@ pub fn bf16_to_f16_at_load(is_quantized: bool, config: Option<&Value>) -> bool {
     // `quantization_config: {modelopt, NVFP4}` but no MLX `quantization` block,
     // and mlx-vlm keeps its bf16 dense weights, f32 queries and f32 router.
     if config.is_some_and(is_inkling2_config) {
+        return false;
+    }
+    // Talkie stays in its checkpoint dtype (issue #2370). Its weightless norms
+    // leave the sublayer inputs unit-RMS while the learned branch gains are
+    // tiny in the early blocks, so the raw branches run far past the f16 max
+    // of 65504: on the 13B instruct model, block 14's SwiGLU product reaches
+    // 1.46e5 and its MLP output 3.36e5 before the 0.024 `mlp_gain`, measured
+    // with mlx-lm on bf16. An f16 load overflows those to inf.
+    if config.is_some_and(is_talkie_config) {
         return false;
     }
     if pre_ampere_cuda() {
@@ -3169,6 +3185,23 @@ mod tests {
         assert!(!is_inkling2_config(
             &serde_json::json!({"model_type": "inkling"})
         ));
+    }
+
+    /// Talkie's raw MLP branch overflows f16 (issue #2370), so every backend
+    /// keeps the checkpoint dtype, quantized packs included.
+    #[test]
+    fn talkie_configs_keep_checkpoint_dtype() {
+        let talkie = serde_json::json!({
+            "model_type": "talkie",
+            "architectures": ["TalkieForCausalLM"],
+            "quantization": {"group_size": 64, "bits": 4}
+        });
+        assert!(is_talkie_config(&talkie));
+        assert!(!is_talkie_config(
+            &serde_json::json!({"model_type": "llama"})
+        ));
+        assert!(!bf16_to_f16_at_load(false, Some(&talkie)));
+        assert!(!bf16_to_f16_at_load(true, Some(&talkie)));
     }
 
     #[test]

@@ -78,7 +78,7 @@ roofline, while per-request decode rate falls proportionally. The defaults:
   Ernie 4.5 dense, ExaOne, Gemma, Gemma 2, GLM-4, Granite, Hunyuan v1 dense,
   GPT-2, GPT-BigCode, GPT-NeoX, GPT-OSS, InternLM 2/3, MiMo, MiniCPM, MiniMax-M3,
   NanoChat, Nemotron, OLMo, OLMo 2/3, OpenELM, Phi, Phi-3, Phi-3-small,
-  StableLM, BitNet, Seed-OSS, SmolLM3, StarCoder2, and
+  StableLM, BitNet, Seed-OSS, SmolLM3, StarCoder2, Talkie, and
   TeleChat3, Mixtral, PhiMoE, Phixtral, Qwen2-MoE, OLMoE, DBRX, DeepSeek v1,
   GLM-4 MoE, ERNIE 4.5 MoE, Hunyuan MoE, Bailing MoE, Dots1, MiniMax,
   Klear, Solar Open, Exaone MoE, and Cohere 2 MoE, plus the MLA backbones
