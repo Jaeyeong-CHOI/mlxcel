@@ -351,7 +351,8 @@ impl PrefillAttention {
 /// Ernie4.5MoeVL, and the global layers of Cohere2MoE, CohereCompass, Olmo3,
 /// Ministral3, Exaone4, ExaoneMoe, Mellum, Step3P5, AFMoE and Gemma3n
 /// (#3072); GptOss, FalconOcr and the sink full layers of MiMoV2 (#3098);
-/// the NoPE global layers of Limite (#2360); the full layers of Plamo3 (#2374).
+/// the NoPE global layers of Limite (#2360); the full layers of Plamo3 (#2374)
+/// and Spark-X2.5 (#2372).
 pub fn prefill_causal_mask(
     seq_len: i32,
     offset: i32,
@@ -433,7 +434,8 @@ pub enum SlidingPrefillKeys {
 /// Used by: Cohere2, Cohere2MoE, CohereCompass, Olmo3, Ministral3, Exaone4,
 /// ExaoneMoe, Mellum, Step3P5, AFMoE, Gemma3n; GptOss, MiMoV2 and an all-local
 /// DeepSeekV4 stack (#3098); Limite, whose window is `sliding_window + 1`
-/// (#2360).
+/// (#2360); Spark-X2.5, whose window is `sliding_window`
+/// (#2372).
 pub fn prefill_sliding_window_mask(
     seq_len: i32,
     prior: i32,

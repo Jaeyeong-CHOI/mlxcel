@@ -289,6 +289,10 @@ fn fallback_architecture(model_type: ModelType) -> &'static str {
         // stacked experts under `mlp.switch_mlp` and rotating sliding caches.
         // This arm only keeps the dispatch table total.
         ModelType::Kolibri1 => "kolibri1",
+        // Not shardable by the generic transformer plan: the fused
+        // `q_k_v_proj`, the per-head `g_proj` gate and the rotating sliding
+        // caches are not in the shard rules. This arm only keeps the table total.
+        ModelType::Spark25 => "spark2_5",
         ModelType::Apertus => "apertus",
         ModelType::SeedOss => "seed_oss",
         ModelType::Granite => "granite",

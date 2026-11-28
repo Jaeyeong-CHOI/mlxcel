@@ -1072,6 +1072,7 @@ pub(crate) fn detect_model_type_with_probes<P: ModelDetectionProbes + ?Sized>(
         // every published checkpoint.
         "klear" => Ok(ModelType::Klear),
         "kolibri1" => Ok(ModelType::Kolibri1),
+        "spark2_5" => Ok(ModelType::Spark25),
         "apertus" => Ok(ModelType::Apertus),
         "seed_oss" => Ok(ModelType::SeedOss),
         "granite" => Ok(ModelType::Granite),

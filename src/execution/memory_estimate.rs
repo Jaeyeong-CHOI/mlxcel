@@ -1334,6 +1334,7 @@ fn inspect_registry_id(model_type: ModelType) -> &'static str {
         ModelType::Arcee => "arcee",
         ModelType::Klear => "klear",
         ModelType::Kolibri1 => "kolibri1",
+        ModelType::Spark25 => "spark2_5",
         ModelType::Apertus => "apertus",
         ModelType::SeedOss => "seed_oss",
         ModelType::Granite => "granite",

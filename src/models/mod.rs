@@ -349,6 +349,11 @@ pub mod seed_oss;
 pub mod siglip_text;
 pub mod smollm3;
 pub mod solar_open;
+pub mod spark2_5;
+pub mod spark2_5_config;
+pub mod spark2_5_layers;
+mod spark2_5_lm;
+pub(crate) mod spark2_5_weights;
 /// Runtime block-vs-chain exactness gate shared by the MTP speculative paths.
 pub mod speculative_exactness;
 pub mod speculative_exactness_diag;
@@ -548,6 +553,7 @@ pub use seed_oss::SeedOssModel;
 pub use siglip_text::{SigLipTextArgs, SigLipTextModel};
 pub use smollm3::SmolLM3Model;
 pub use solar_open::SolarOpenModel;
+pub use spark2_5::Spark25Model;
 pub use stablelm::StableLMModel;
 pub use starcoder2::StarCoder2Model;
 pub use step3p5::Step3p5Model;
@@ -738,6 +744,10 @@ pub enum ModelType {
     /// MoE without the attention gate, 384 experts top-6 routed on raw
     /// logits plus a correction bias, and a shared expert.
     Kolibri1,
+    /// Spark-X2.5 (`spark2_5`): dense three-sliding-to-one-full hybrid with
+    /// per-layer-type partial RoPE, a fused q/k/v projection and a per-head
+    /// sigmoid attention gate.
+    Spark25,
 
     // Apertus (Swiss AI)
     Apertus,
@@ -1019,6 +1029,7 @@ pub const ALL_MODEL_TYPES: &[ModelType] = &[
     ModelType::Arcee,
     ModelType::Klear,
     ModelType::Kolibri1,
+    ModelType::Spark25,
     // Apertus (Swiss AI)
     ModelType::Apertus,
     // ByteDance Seed-OSS
@@ -1281,6 +1292,7 @@ impl ModelType {
                 "Aleph Alpha Kolibri-1 (sliding + full hybrid MoE)",
                 "Aleph Alpha",
             ),
+            ModelType::Spark25 => ("Spark-X2.5 (sliding + full hybrid, per-head gate)", "Spark"),
             ModelType::BailingMoeLinear => (
                 "Ling / Ring linear-attention MoE (GLA + full attention hybrid)",
                 "Bailing",
@@ -1731,6 +1743,7 @@ mod metadata_tests {
             Arcee,
             Klear,
             Kolibri1,
+            Spark25,
             Apertus,
             SeedOss,
             Granite,

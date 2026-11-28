@@ -23,7 +23,8 @@
 //! each impl delegates to them (issue #3297).
 //!
 //! Used by: AFMoE (`src/models/afmoe.rs`), Kolibri-1
-//! (`src/models/kolibri1_lm.rs`) and PLaMo 3 (`src/models/plamo3_lm.rs`).
+//! (`src/models/kolibri1_lm.rs`), PLaMo 3 (`src/models/plamo3_lm.rs`) and
+//! Spark-X2.5 (`src/models/spark2_5_lm.rs`).
 
 use mlxcel_core::cache::{CachePool, KVCacheMode, SequenceId, SequenceStateLayout};
 use mlxcel_core::generate::{LanguageModel, ModelStateSnapshot};
@@ -41,7 +42,7 @@ use mlxcel_core::cache::LayerStateKind;
 /// The accessor names carry a `hybrid_` prefix so they never collide with a
 /// `LanguageModel` method or the model's own inherent methods.
 pub(crate) trait SlidingHybridModel: LanguageModel {
-    /// Snapshot family tag (`"afmoe"`, `"kolibri1"`), also the prefix of the
+    /// Snapshot family tag (`"afmoe"`, `"kolibri1"`, `"spark2_5"`), also the prefix of the
     /// batched-decode panic messages. A snapshot never restores into a family
     /// with another tag, even one that shares the `Cache` enum.
     const FAMILY: &'static str;

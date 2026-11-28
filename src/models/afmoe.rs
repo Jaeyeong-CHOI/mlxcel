@@ -713,7 +713,7 @@ impl ModelArgs {
     }
 }
 
-/// Used by: AFMoE, Kolibri1.
+/// Used by: AFMoE, Kolibri1, Spark-X2.5.
 pub(crate) fn rms_norm_from_weights(
     weights: &WeightMap,
     key: &str,
@@ -1590,7 +1590,7 @@ impl AfmoeModel {
 /// MLX's causal mode or native window route instead and MLX fuses it (#3072).
 /// `geometry` answers a layer index with that layer's attention shape.
 ///
-/// Used by: AFMoE, Kolibri1.
+/// Used by: AFMoE, Kolibri1, Spark-X2.5.
 pub(crate) fn hybrid_prefill_masks(
     h: &MlxArray,
     caches: &mut [Cache],
@@ -1670,7 +1670,7 @@ pub(crate) fn validate_quantized_packing(
     )
 }
 
-/// Used by: AFMoE, Kolibri1, PLaMo 3.
+/// Used by: AFMoE, Kolibri1, PLaMo 3, Spark-X2.5.
 pub(crate) fn validate_projection(
     weights: &WeightMap,
     prefix: &str,
@@ -1703,7 +1703,7 @@ pub(crate) fn validate_projection(
     validate_quantized_packing(weights, prefix, in_features, group_size, bits)
 }
 
-/// Used by: AFMoE, Kolibri1, PLaMo 3.
+/// Used by: AFMoE, Kolibri1, PLaMo 3, Spark-X2.5.
 pub(crate) fn validate_norm(weights: &WeightMap, key: &str, dim: usize) -> Result<(), String> {
     let weight = weights
         .get(key)

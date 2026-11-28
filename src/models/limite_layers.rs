@@ -64,6 +64,8 @@ fn scale_by(a: &MlxArray, x: &MlxArray) -> UniquePtr<MlxArray> {
 /// MLX `nn.gelu` in the input dtype: `x * (1 + erf(x / sqrt(2))) / 2`.
 /// `mlxcel_core::gelu` computes in f32 and casts back, which rounds
 /// differently from the reference's bf16 arithmetic.
+///
+/// Used by: Limite, Spark-X2.5 (`spark2_5_layers.rs`, its MLP).
 pub(crate) fn gelu_erf(x: &MlxArray) -> UniquePtr<MlxArray> {
     let dt = mlxcel_core::array_dtype(x);
     let t = mlxcel_core::divide(x, &scalar(std::f32::consts::SQRT_2, dt));
