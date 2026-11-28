@@ -183,6 +183,7 @@ const EXPECTED_DELEGATING: &[&str] = &[
     "Moondream3VLModel@src/vision/moondream3_vl.rs",
     "MuseGlimmerVlmModel@src/vision/muse_glimmer_vlm.rs",
     "NemotronHNanoOmniVlModel@src/vision/nemotron_h_nano_omni_vl.rs",
+    "OxrVlModel@src/vision/oxr_vl.rs",
     "Phi3VLModel@src/vision/phi3_vl.rs",
     "Phi4SigLipVLModel@src/vision/phi4_siglip_vl.rs",
     "Plamo2VlModel@src/vision/plamo2_vl.rs",
@@ -401,6 +402,7 @@ fn issue_2564_vlm_towers_and_wrappers_pin_the_native_decode_contract() {
         "src/vision/moondream2_vl.rs",
         "src/vision/moondream3_vl.rs",
         "src/vision/dots_ocr.rs",
+        "src/vision/oxr_vl.rs",
         "src/vision/minicpmo_vl.rs",
     ] {
         let source = fs::read_to_string(root.join(relative)).expect("wrapper source is readable");

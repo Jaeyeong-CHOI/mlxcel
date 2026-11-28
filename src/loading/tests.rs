@@ -575,3 +575,12 @@ fn conv1d_weight_is_channel_last_detects_depthwise_mlx_layout() {
     assert!(!conv1d_weight_is_channel_last(&[1024, 5, 1, 1]));
     assert!(!conv1d_weight_is_channel_last(&[4, 4]));
 }
+
+#[test]
+fn oxr_context_window_uses_decoder_limit_for_both_config_spellings() {
+    for key in ["llm_config", "text_config"] {
+        let config = json!({"model_type":"oxr", "max_position_embeddings":40960,
+                            key: {"max_position_embeddings":32768}});
+        assert_eq!(context_window_from_config(&config), Some(32768));
+    }
+}

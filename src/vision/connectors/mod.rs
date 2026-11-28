@@ -26,6 +26,7 @@ pub mod lfm2_vl;
 pub mod linear;
 pub mod mistral3;
 pub mod mlp;
+pub mod oxr_visual_tokenizer;
 pub mod paddleocr_vl;
 pub mod plamo2_vl;
 pub mod step3p7;

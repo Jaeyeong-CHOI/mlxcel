@@ -1260,6 +1260,7 @@ fn inspect_registry_id(model_type: ModelType) -> &'static str {
         ModelType::CohereCompassVLM => "cohere_compass",
         ModelType::PaddleOcrVL => "paddleocr_vl",
         ModelType::DotsOcrVL => "dots_ocr_vl",
+        ModelType::OxrVL => "oxr",
         ModelType::FalconOcrVL => "falcon_ocr_vl",
         ModelType::JinaVLM => "jina_vlm",
         ModelType::Glm4v => "glm4v",

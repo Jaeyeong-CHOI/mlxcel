@@ -1217,6 +1217,9 @@ pub(crate) async fn prepare_chat_request_with_cache_and_video_allowlist(
         .as_deref()
         .and_then(|history| system_root_prefix(root_render, history));
 
+    // Check the rendered markers against the request before fetching any images.
+    processor.validate_image_placeholders(&prompt, declared_images)?;
+
     // Validate the per-request soft-token budget before any image is fetched or
     // decoded: an unsupported `detail` / `max_soft_tokens` is a client error, so
     // there is no reason to spend a download or a decode on it first.

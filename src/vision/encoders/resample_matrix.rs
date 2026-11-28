@@ -141,6 +141,8 @@ pub(crate) fn interp_matrix(
     m
 }
 
+/// Used by: Kimi-VL, DeepSeek-OCR and OXR.
+///
 /// Separable resample of a `[in_h, in_w, dim]` grid to `[out_h, out_w, dim]`
 /// with the given `[out_h, in_h]` and `[out_w, in_w]` row-major weight
 /// matrices: rows first, then columns. The matrices are float32, so the result

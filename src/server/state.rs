@@ -754,10 +754,11 @@ pub(crate) fn attach_native_chat_renderer_for_model(
     // An operator template override (`--chat-template`) builds the processor
     // without the model directory; the steering block is the model's, so it
     // is attached from the directory either way (#3435).
-    if let Some(dir) = model_dir
-        && chat_template.reasoning_effort_steering().is_none()
-    {
-        chat_template.attach_reasoning_effort_steering_from(dir);
+    if let Some(dir) = model_dir {
+        chat_template.attach_image_count_validator(dir);
+        if chat_template.reasoning_effort_steering().is_none() {
+            chat_template.attach_reasoning_effort_steering_from(dir);
+        }
     }
     if let Some(renderer) = &mut chat_template.deepseek_vl2 {
         renderer.tokenizer = Some(Arc::clone(&tokenizer));

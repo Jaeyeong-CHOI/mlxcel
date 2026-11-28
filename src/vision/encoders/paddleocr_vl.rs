@@ -27,7 +27,7 @@
 //! The spatial-merge projector lives in the connector
 //! (`vision::connectors::paddleocr_vl`), matching the reference module split.
 //!
-//! Used by: PaddleOCR-VL
+//! Used by: PaddleOCR-VL; OXR shares the patch embedding and encoder layers.
 //! Reference: https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/paddleocr_vl/vision.py.
 
 use super::VisionEncoderOutput;
@@ -107,13 +107,14 @@ fn load_layer_norm(weights: &WeightMap, prefix: &str, eps: f32) -> Result<LayerN
 }
 
 // Patch embedding: Conv2d(kernel == stride == patch) evaluated as a Linear.
-struct PatchEmbed {
+/// Used by: PaddleOCR-VL and OXR.
+pub(super) struct PatchEmbed {
     weight: UniquePtr<MlxArray>, // [embed, C * patch * patch]
     bias: Option<UniquePtr<MlxArray>>,
 }
 
 impl PatchEmbed {
-    fn from_weights(
+    pub(super) fn from_weights(
         weights: &WeightMap,
         config: &PaddleOcrVisionConfig,
         prefix: &str,
@@ -155,7 +156,7 @@ impl PatchEmbed {
     }
 
     /// hidden_states: `[total_patches, C * patch * patch]` -> `[total_patches, embed]`.
-    fn forward(&self, hidden_states: &MlxArray) -> UniquePtr<MlxArray> {
+    pub(super) fn forward(&self, hidden_states: &MlxArray) -> UniquePtr<MlxArray> {
         let wt = mlxcel_core::transpose(&self.weight);
         let out = mlxcel_core::matmul(hidden_states, &wt);
         match &self.bias {
@@ -621,7 +622,8 @@ impl MLP {
     }
 }
 
-struct EncoderLayer {
+/// Used by: PaddleOCR-VL and OXR.
+pub(super) struct EncoderLayer {
     layer_norm1: LayerNorm,
     layer_norm2: LayerNorm,
     attn: Attention,
@@ -629,22 +631,28 @@ struct EncoderLayer {
 }
 
 impl EncoderLayer {
-    fn from_weights(
+    pub(super) fn from_weights(
         weights: &WeightMap,
         config: &PaddleOcrVisionConfig,
         prefix: &str,
+        eps: f32,
         gs: i32,
         bits: i32,
     ) -> Result<Self, String> {
         Ok(Self {
-            layer_norm1: load_layer_norm(weights, &format!("{prefix}.layer_norm1"), 1e-6)?,
-            layer_norm2: load_layer_norm(weights, &format!("{prefix}.layer_norm2"), 1e-6)?,
+            layer_norm1: load_layer_norm(weights, &format!("{prefix}.layer_norm1"), eps)?,
+            layer_norm2: load_layer_norm(weights, &format!("{prefix}.layer_norm2"), eps)?,
             attn: Attention::from_weights(weights, config, prefix, gs, bits)?,
             mlp: MLP::from_weights(weights, prefix, gs, bits)?,
         })
     }
 
-    fn forward(&self, x: &MlxArray, cu_seqlens: &[i32], rotary: &MlxArray) -> UniquePtr<MlxArray> {
+    pub(super) fn forward(
+        &self,
+        x: &MlxArray,
+        cu_seqlens: &[i32],
+        rotary: &MlxArray,
+    ) -> UniquePtr<MlxArray> {
         let attn_out = self
             .attn
             .forward(&self.layer_norm1.forward(x), cu_seqlens, rotary);
@@ -693,6 +701,7 @@ impl PaddleOcrVisionEncoder {
                 weights,
                 config,
                 &format!("{prefix}.layers.{i}"),
+                1e-6,
                 gs,
                 bits,
             )?);

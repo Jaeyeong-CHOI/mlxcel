@@ -440,6 +440,7 @@ fn try_load_vlm_model_from_dir(
         ModelType::PaddleOcrVL => Some(load_paddleocr_vl(model_path)?),
         ModelType::Step3p7 => Some(load_step3p7_vl(model_path)?),
         ModelType::DotsOcrVL => Some(load_dots_ocr_vl(model_path)?),
+        ModelType::OxrVL => Some(load_oxr_vl(model_path)?),
         ModelType::FalconOcrVL => Some(load_falcon_ocr_vl(model_path)?),
         ModelType::JinaVLM => Some(load_jina_vlm(model_path)?),
         ModelType::Glm4v => Some(load_glm4v(model_path)?),
@@ -714,12 +715,8 @@ pub fn context_window_from_config(config: &serde_json::Value) -> Option<usize> {
         "n_positions",
         "max_sequence_length",
     ];
-    let mut candidates: Vec<&serde_json::Value> = Vec::with_capacity(2);
-    if let Some(text) = config.get("text_config") {
-        candidates.push(text);
-    }
-    candidates.push(config);
-    for obj in candidates {
+    let decoder = crate::execution::config_fields::nested_text_config(config);
+    for obj in decoder.into_iter().chain(std::iter::once(config)) {
         for key in KEYS {
             if let Some(value) = obj.get(key).and_then(serde_json::Value::as_u64)
                 && value > 0

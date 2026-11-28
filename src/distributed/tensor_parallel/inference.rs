@@ -236,6 +236,7 @@ fn fallback_architecture(model_type: ModelType) -> &'static str {
         ModelType::GlmMoeDsa => "glm_moe_dsa",
         ModelType::Ernie45 | ModelType::PaddleOcrVL => "ernie4_5",
         ModelType::DotsOcrVL => "qwen2",
+        ModelType::OxrVL => "qwen3",
         // Falcon-OCR has no separate text backbone: the early-fusion decoder is
         // the model. TP refuses VLM-kind models before this table is read.
         ModelType::FalconOcrVL => "falcon_ocr",

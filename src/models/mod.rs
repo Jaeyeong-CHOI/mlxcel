@@ -611,6 +611,7 @@ pub enum ModelType {
     CohereCompassVLM,  // Cohere Compass / North-Micro-Vision (Qwen3-VL tower + Command decoder)
     PaddleOcrVL,       // PaddleOCR-VL (NaViT vision + ERNIE-4.5 w/ MRoPE)
     DotsOcrVL,         // dots.ocr (dots_vit ViT + Qwen2 text decoder)
+    OxrVL,             // OXR (SigLIP2 NaViT + Qwen3 text decoder)
     FalconOcrVL,       // Falcon-OCR (early-fusion patch projector, no vision tower)
     JinaVLM,           // Jina VLM (SigLIP-class ViT + Molmo-style connector + Qwen2 text)
     Glm4v,             // GLM-4V (GLM-4V ViT + GLM-4 text w/ sectioned MRoPE)
@@ -941,6 +942,7 @@ pub const ALL_MODEL_TYPES: &[ModelType] = &[
     ModelType::CohereCompassVLM,
     ModelType::PaddleOcrVL,
     ModelType::DotsOcrVL,
+    ModelType::OxrVL,
     ModelType::FalconOcrVL,
     ModelType::JinaVLM,
     ModelType::Glm4v,
@@ -1173,6 +1175,7 @@ impl ModelType {
             ModelType::CohereCompassVLM => ("Cohere Compass / North-Micro-Vision", "Other VLM"),
             ModelType::PaddleOcrVL => ("PaddleOCR-VL", "PaddleOCR VLM"),
             ModelType::DotsOcrVL => ("dots.ocr (dots_vit + Qwen2)", "Other VLM"),
+            ModelType::OxrVL => ("OXR (SigLIP2 NaViT + Qwen3)", "Other VLM"),
             ModelType::FalconOcrVL => ("Falcon-OCR (early fusion)", "Other VLM"),
             ModelType::JinaVLM => (
                 "Jina VLM (SigLIP-so400m + 2x2 attention pooling + Qwen2 text)",
@@ -1657,6 +1660,7 @@ mod metadata_tests {
             CohereCompassVLM,
             PaddleOcrVL,
             DotsOcrVL,
+            OxrVL,
             FalconOcrVL,
             JinaVLM,
             Glm4v,

@@ -1337,6 +1337,7 @@ where
         )?;
     }
     if !should_prepare_vlm_embeddings(images.len(), model.is_vlm())? {
+        model.validate_image_placeholders(prompt, images.len())?;
         return Ok(None);
     }
 
@@ -1474,6 +1475,27 @@ where
             Ok(Some(PreparedVlmEmbeddings {
                 embeddings,
                 preparation,
+            }))
+        }
+        VlmRuntimeRef::Oxr(model) => {
+            let grids = images
+                .iter()
+                .map(|image| model.processor.grid(image.height(), image.width()))
+                .collect::<Result<Vec<_>>>()?;
+            let total_image_tokens = i32::try_from(grids.iter().map(|g| g.atoms()).sum::<usize>())?;
+            let expanded = crate::vision::oxr_vl::expand_prompt(prompt, &grids)?;
+            *prompt_tokens = encode(&expanded, false);
+            let embeddings = model.embeddings(prompt_tokens, images, &grids)?;
+            // OXR has the same variable-length start/pad/end image blocks as
+            // Qwen-VL, so its preparation reports the same block and token counts.
+            Ok(Some(PreparedVlmEmbeddings {
+                embeddings,
+                preparation: Some(VlmPreparationSummary::QwenVlm {
+                    image_blocks: grids.len(),
+                    video_blocks: 0,
+                    total_image_tokens,
+                    total_video_tokens: 0,
+                }),
             }))
         }
         VlmRuntimeRef::DotsOcr(dots) => {

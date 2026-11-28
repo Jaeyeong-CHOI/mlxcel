@@ -34,6 +34,8 @@
 
 use mlxcel_core::{MlxArray, UniquePtr};
 
+/// Used by: Mage-VL and OXR.
+///
 /// Per-row `(t, h, w)` positions for a sequence of images or clips, in the
 /// processor's merge-block row order.
 ///

@@ -147,6 +147,7 @@ macro_rules! for_each_model_registration {
             CohereCompassVLM => { kind: Vlm, directory: Vlm, weight: None, adapter: Some("Cohere Compass / North-Micro-Vision cannot be loaded with LoRA adapters yet") };
             PaddleOcrVL => { kind: Vlm, directory: Vlm, weight: None, adapter: Some("PaddleOCR-VL cannot be loaded with LoRA adapters yet") };
             DotsOcrVL => { kind: Vlm, directory: Vlm, weight: None, adapter: Some("dots.ocr cannot be loaded with LoRA adapters yet") };
+            OxrVL => { kind: Vlm, directory: Vlm, weight: None, adapter: Some("OXR cannot be loaded with LoRA adapters yet") };
             FalconOcrVL => { kind: Vlm, directory: Vlm, weight: None, adapter: Some("Falcon-OCR cannot be loaded with LoRA adapters yet") };
             JinaVLM => { kind: Vlm, directory: Vlm, weight: None, adapter: Some("Jina VLM cannot be loaded with LoRA adapters yet") };
             Glm4v => { kind: Vlm, directory: Vlm, weight: None, adapter: Some("GLM-4V cannot be loaded with LoRA adapters yet") };

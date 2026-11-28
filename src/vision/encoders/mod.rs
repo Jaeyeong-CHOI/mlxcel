@@ -61,6 +61,7 @@ pub mod muse_glimmer_layers;
 pub mod muse_glimmer_layout;
 pub mod muse_glimmer_pos;
 pub mod nemotron_h_nano_omni;
+pub mod oxr_siglip2_navit;
 pub mod paddleocr_vl;
 pub mod phi4_siglip;
 pub mod pixtral;

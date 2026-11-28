@@ -200,6 +200,15 @@ pub fn flatten_template_text(content: &serde_json::Value) -> String {
     }
 }
 
+type ImageCountValidator = fn(&str, usize) -> Result<()>;
+
+fn image_count_validator_for(family: crate::models::ModelType) -> Option<ImageCountValidator> {
+    match family {
+        crate::models::ModelType::OxrVL => Some(crate::vision::oxr_vl::check_placeholders),
+        _ => None,
+    }
+}
+
 /// Chat template processor
 #[derive(Clone)]
 pub struct ChatTemplateProcessor {
@@ -268,6 +277,7 @@ pub struct ChatTemplateProcessor {
     numbered_image_tags: Option<NumberedImageTags>,
     /// DeepSeek-VL2 formats each message with its checkpoint processor.
     pub(crate) deepseek_vl2: Option<super::deepseek_vl2_chat::Renderer>,
+    image_count_validator: Option<ImageCountValidator>,
     /// A native, code-rendered chat format that replaces the Jinja template
     /// entirely (#1338).
     ///
@@ -328,8 +338,10 @@ impl GenerationPromptSuffix {
 
 /// The completion rule a model family needs, or `None` for the overwhelming
 /// majority whose template renders a complete generation prompt on its own.
-fn generation_prompt_suffix_for(model_path: &Path) -> Option<GenerationPromptSuffix> {
-    match crate::models::get_model_type(model_path).ok()? {
+fn generation_prompt_suffix_for(
+    family: crate::models::ModelType,
+) -> Option<GenerationPromptSuffix> {
+    match family {
         crate::models::ModelType::LlmJpVLM => Some(GenerationPromptSuffix {
             opener: crate::multimodal::llmjp_vl_prompt::LLMJP_ASSISTANT_OPENER,
             suffix: crate::multimodal::llmjp_vl_prompt::LLMJP_GENERATION_PROMPT_SUFFIX,
@@ -367,8 +379,8 @@ impl NumberedImageTags {
 
 /// The per-message image tag numbering a model family needs, or `None` for
 /// every family whose runtime places image tokens some other way.
-fn numbered_image_tags_for(model_path: &Path) -> Option<NumberedImageTags> {
-    match crate::models::get_model_type(model_path).ok()? {
+fn numbered_image_tags_for(family: crate::models::ModelType) -> Option<NumberedImageTags> {
+    match family {
         crate::models::ModelType::Phi3VLM => Some(NumberedImageTags::Phi3V),
         crate::models::ModelType::Phi4MMVLM => Some(NumberedImageTags::Phi4MM),
         _ => None,
@@ -525,9 +537,10 @@ impl ChatTemplateProcessor {
             supports_tools_cached: None,
             forced_tool_call_format,
             default_enable_thinking: false,
-            generation_prompt_suffix: generation_prompt_suffix_for(model_path),
+            generation_prompt_suffix: family.and_then(generation_prompt_suffix_for),
             numbered_image_tags: None,
             deepseek_vl2: None,
+            image_count_validator: family.and_then(image_count_validator_for),
             kimi_k3: None,
             kimi_k3_family_unrenderable: false,
             reasoning_effort_steering: None,
@@ -536,8 +549,9 @@ impl ChatTemplateProcessor {
         };
         processor.wrap_string_content = template_requires_typed_text_content(&processor);
         processor.attach_reasoning_effort_steering_from(model_path);
-        processor.numbered_image_tags =
-            numbered_image_tags_for(model_path).filter(|_| !processor.supports_image_content());
+        processor.numbered_image_tags = family
+            .and_then(numbered_image_tags_for)
+            .filter(|_| !processor.supports_image_content());
         Ok(Some(processor))
     }
 
@@ -558,12 +572,27 @@ impl ChatTemplateProcessor {
             generation_prompt_suffix: None,
             numbered_image_tags: None,
             deepseek_vl2: None,
+            image_count_validator: None,
             kimi_k3: None,
             kimi_k3_family_unrenderable: false,
             reasoning_effort_steering: None,
             #[cfg(test)]
             template_compile_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// Use the active checkpoint's marker contract even with a custom template.
+    pub(crate) fn attach_image_count_validator(&mut self, model_path: &Path) {
+        self.image_count_validator = crate::models::get_model_type(model_path)
+            .ok()
+            .and_then(image_count_validator_for);
+    }
+
+    pub(crate) fn validate_image_placeholders(&self, prompt: &str, count: usize) -> Result<()> {
+        if let Some(validate) = self.image_count_validator {
+            validate(prompt, count)?;
+        }
+        Ok(())
     }
 
     /// Whether this processor renders with the generic fallback template
@@ -2433,6 +2462,49 @@ mod deepseek_vl2_chat_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oxr_image_placeholders_follow_the_checkpoint_with_a_template_override() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("chat_template.jinja"),
+            "checkpoint template",
+        )
+        .unwrap();
+        for family in ["oxr", "qwen3"] {
+            std::fs::write(
+                dir.path().join("config.json"),
+                serde_json::json!({"model_type": family}).to_string(),
+            )
+            .unwrap();
+            let shipped = ChatTemplateProcessor::from_model_path(dir.path())
+                .unwrap()
+                .unwrap();
+            let (_, custom) = crate::server::state::attach_native_chat_renderer_for_model(
+                crate::tokenizer::MlxcelTokenizer::stub(),
+                ChatTemplateProcessor::with_template("operator template".into()),
+                Some(dir.path()),
+            );
+            for processor in [shipped, custom] {
+                for (prompt, images) in [("hi", 0), ("<image> <image>", 2)] {
+                    processor
+                        .validate_image_placeholders(prompt, images)
+                        .unwrap();
+                }
+                for (prompt, images, expected) in [
+                    ("hi", 1, "0 <image> placeholders for 1 images"),
+                    ("<image>", 0, "1 <image> placeholders for 0 images"),
+                ] {
+                    let result = processor.validate_image_placeholders(prompt, images);
+                    if family == "oxr" {
+                        assert!(result.unwrap_err().to_string().contains(expected));
+                    } else {
+                        result.unwrap();
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn generic_default_is_true_only_for_the_fallback_template() {

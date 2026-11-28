@@ -46,6 +46,7 @@ pub mod molmo_point;
 pub mod moondream3;
 pub mod muse_glimmer;
 pub mod nemotron_h_nano_omni;
+pub mod oxr;
 pub mod paddleocr_vl;
 pub mod phi3_v;
 pub mod phi4_siglip;

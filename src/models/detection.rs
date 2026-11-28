@@ -1179,6 +1179,7 @@ pub(crate) fn detect_model_type_with_probes<P: ModelDetectionProbes + ?Sized>(
         "qwen3_omni_moe" => Ok(ModelType::Qwen3OmniMoe),
         "paddleocr_vl" => Ok(ModelType::PaddleOcrVL),
         "dots_ocr" => Ok(ModelType::DotsOcrVL),
+        "oxr" => Ok(ModelType::OxrVL),
         "falcon_ocr" => Ok(ModelType::FalconOcrVL),
         // IndicOCR ships as a two-stage repository (layout + Qwen3.5 OCR) whose
         // root config carries `stages`, and as a flat OCR-stage config with

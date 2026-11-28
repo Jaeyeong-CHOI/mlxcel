@@ -105,6 +105,8 @@ mod muse_glimmer;
 mod nemotron_h_nano_omni;
 #[path = "vlm_nemotron_parse.rs"]
 mod nemotron_parse;
+#[path = "vlm_oxr.rs"]
+mod oxr;
 #[path = "vlm_paddleocr.rs"]
 mod paddleocr;
 #[path = "vlm_pixtral.rs"]
@@ -177,6 +179,7 @@ pub(crate) use muse_glimmer::{
 };
 pub(crate) use nemotron_h_nano_omni::load_nemotron_h_nano_omni_vlm;
 pub(crate) use nemotron_parse::load_nemotron_parse_vlm;
+pub(crate) use oxr::load_oxr_vl;
 pub(crate) use paddleocr::load_paddleocr_vl;
 pub(crate) use pixtral::{load_mistral3_vlm, load_pixtral_vlm};
 pub(crate) use plamo2_vl::load_plamo2_vl;

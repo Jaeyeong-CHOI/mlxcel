@@ -49,6 +49,7 @@ pub enum VlmRuntimeRef<'a> {
     /// Step-3.7 runtime (perception_encoder ViT + Step-3.5 MoE text).
     Step3p7(&'a vision::Step3p7VlModel),
     DotsOcr(&'a vision::DotsOcrVlModel),
+    Oxr(&'a vision::OxrVlModel),
     /// Falcon-OCR runtime (early-fusion patch projector, no vision tower).
     FalconOcr(&'a vision::FalconOcrVlModel),
     /// Jina VLM runtime (SigLIP-class ViT + Molmo-style connector + Qwen2 text).
@@ -167,6 +168,20 @@ pub(crate) fn image_token_block_info_from_runtime(
 }
 
 impl LoadedModel {
+    /// Validate a family's literal image markers before falling back to text.
+    ///
+    /// Used by: `vlm_runtime.rs` and `model_worker.rs` before text-only prefill.
+    pub(crate) fn validate_image_placeholders(
+        &self,
+        prompt: &str,
+        count: usize,
+    ) -> anyhow::Result<()> {
+        if matches!(self, Self::OxrVL(_)) {
+            crate::vision::oxr_vl::check_placeholders(prompt, count)?;
+        }
+        Ok(())
+    }
+
     /// Check if this model is a vision-language model.
     pub fn is_vlm(&self) -> bool {
         self.vlm_runtime().is_some()
@@ -241,6 +256,7 @@ impl LoadedModel {
             Self::PaddleOcrVL(model) => Some(VlmRuntimeRef::PaddleOcr(model)),
             Self::Step3p7VL(model) => Some(VlmRuntimeRef::Step3p7(model)),
             Self::DotsOcrVL(model) => Some(VlmRuntimeRef::DotsOcr(model)),
+            Self::OxrVL(model) => Some(VlmRuntimeRef::Oxr(model)),
             Self::FalconOcrVL(model) => Some(VlmRuntimeRef::FalconOcr(model)),
             Self::JinaVLM(model) => Some(VlmRuntimeRef::JinaVlm(model)),
             Self::MiniCPMOVLM(model) => Some(VlmRuntimeRef::MiniCPMO(model)),

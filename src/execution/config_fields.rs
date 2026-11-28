@@ -82,7 +82,17 @@ pub(crate) const MULTI_QUERY_KEY: &str = "multi_query";
 /// The decoder sub-object of a VLM config, or the config itself for text
 /// models. VLMs nest the language model under `text_config`.
 pub(crate) fn text_config(config: &Value) -> &Value {
-    config.get("text_config").unwrap_or(config)
+    nested_text_config(config).unwrap_or(config)
+}
+
+/// The original OXR checkpoint uses `llm_config` as its Qwen3 decoder config.
+/// Other families can give that key a different meaning.
+pub(crate) fn nested_text_config(config: &Value) -> Option<&Value> {
+    config.get("text_config").or_else(|| {
+        (config.get("model_type").and_then(Value::as_str) == Some("oxr"))
+            .then(|| config.get("llm_config"))
+            .flatten()
+    })
 }
 
 /// The decoder section the KV cache rules and the KV sizing read.
@@ -95,7 +105,7 @@ pub(crate) fn text_config(config: &Value) -> &Value {
 ///
 /// Used by: [`kv_decoder_model_type`], `execution::kv_arch` (sizing).
 pub(crate) fn kv_decoder_config(config: &Value) -> Cow<'_, Value> {
-    if let Some(text) = config.get("text_config") {
+    if let Some(text) = nested_text_config(config) {
         return Cow::Borrowed(text);
     }
     let is_vl2 = config

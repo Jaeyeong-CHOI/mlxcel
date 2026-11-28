@@ -2676,3 +2676,24 @@ fn longcat_flash_sparse_is_detected_with_and_without_model_type() {
     assert!(err.to_string().contains("model_type"), "{err}");
     fs::remove_dir_all(model_dir).unwrap();
 }
+
+#[test]
+fn oxr_detects_original_and_converted_configs() {
+    for (text, vision) in [
+        ("llm_config", "vit_config"),
+        ("text_config", "vision_config"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            json!({
+                "model_type": "oxr", "architectures": ["OXR"],
+                (text): {"model_type": "qwen3"}, (vision): {"model_type": "siglip2_navit"}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let family = super::detection::get_model_type(dir.path()).unwrap();
+        assert_eq!(family, ModelType::OxrVL);
+    }
+}

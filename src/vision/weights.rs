@@ -249,7 +249,7 @@ pub(crate) fn resolve_param_quantization(
 /// Load a learned vision parameter as a dense array, dequantizing a packed
 /// `<key>` / sibling `.scales` / optional `.biases` triple when present.
 ///
-/// Used by: Gemma4 and Gemma4-Unified; Step3p7; Llama4; Molmo, Molmo2 and
+/// Used by: OXR; Gemma4 and Gemma4-Unified; Step3p7; Llama4; Molmo, Molmo2 and
 /// MolmoPoint; Jina-VLM; InternVL; DeepSeek-VL2 and DeepSeek-OCR; Moondream;
 /// MoonViT3D; Nemotron-H Nano Omni; Idefics2; Hunyuan-VL framing; Granite and
 /// Granite4 Vision; DINOv2; RF-DETR; SAM3, SAM3.1 and SAM3D Body; Inkling 2;

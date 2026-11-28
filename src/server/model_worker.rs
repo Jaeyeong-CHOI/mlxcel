@@ -1772,6 +1772,7 @@ pub(crate) fn prepare_request_vlm_embeddings(
     }
     if !has_media || !model.is_vlm() {
         if !has_media {
+            model.validate_image_placeholders(prompt, 0)?;
             match model {
                 LoadedModel::MuseGlimmerVLM(muse) => {
                     crate::multimodal::muse_glimmer_runtime::reject_muse_glimmer_text_fallback(
