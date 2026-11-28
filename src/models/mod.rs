@@ -1905,6 +1905,10 @@ pub(crate) mod gemma4_tests;
 mod gemma4_ring_checkpoint_tests;
 
 #[cfg(test)]
+#[path = "gemma4_quantized_snapshot_tests.rs"]
+mod gemma4_quantized_snapshot_tests;
+
+#[cfg(test)]
 #[path = "llama4_helpers_tests.rs"]
 mod llama4_helpers_tests;
 
